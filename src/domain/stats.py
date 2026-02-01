@@ -17,6 +17,13 @@ def max_drawdown(equity: pd.Series) -> float:
     return float(dd.min())
 
 
+def drawdown_series(equity: pd.Series) -> pd.Series:
+    peak = equity.cummax()
+    dd = (equity / peak) - 1.0
+    dd.name = "drawdown"
+    return dd
+
+
 def annualized_vol(daily_ret: pd.Series, trading_days: int = 252) -> float:
     return float(daily_ret.std(ddof=1) * np.sqrt(trading_days))
 
