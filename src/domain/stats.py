@@ -39,3 +39,43 @@ def sharpe(daily_ret: pd.Series, rf: float = 0.0, trading_days: int = 252) -> fl
     if denom == 0 or np.isnan(denom):
         return float("nan")
     return float((excess.mean() / denom) * np.sqrt(trading_days))
+
+
+def rolling_volatility(
+    daily_ret: pd.Series, window: int, trading_days: int = 252
+) -> pd.Series:
+    rolling_std = daily_ret.rolling(window=window, min_periods=window).std(ddof=1)
+    return rolling_std * np.sqrt(trading_days)
+
+
+def rolling_sharpe(
+    daily_ret: pd.Series, window: int, trading_days: int = 252
+) -> pd.Series:
+    rolling_mean = daily_ret.rolling(window=window, min_periods=window).mean()
+    rolling_std = daily_ret.rolling(window=window, min_periods=window).std(ddof=1)
+    sharpe_series = rolling_mean / rolling_std.replace(0.0, np.nan)
+    return sharpe_series * np.sqrt(trading_days)
+
+
+def rolling_max_drawdown(daily_ret: pd.Series, window: int) -> pd.Series:
+    def _window_mdd(values: np.ndarray) -> float:
+        equity = np.cumprod(1.0 + values)
+        peak = np.maximum.accumulate(equity)
+        dd = equity / peak - 1.0
+        return float(np.min(dd))
+
+    return daily_ret.rolling(window=window, min_periods=window).apply(
+        _window_mdd, raw=True
+    )
+
+
+def rolling_metrics(
+    daily_ret: pd.Series, window: int, trading_days: int = 252
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "rolling_vol": rolling_volatility(daily_ret, window, trading_days),
+            "rolling_sharpe": rolling_sharpe(daily_ret, window, trading_days),
+            "rolling_max_drawdown": rolling_max_drawdown(daily_ret, window),
+        }
+    )

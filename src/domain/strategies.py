@@ -44,6 +44,32 @@ def _sharpe_scores(window: pd.DataFrame) -> pd.Series:
     return scores
 
 
+def _risk_parity_weights(window: pd.DataFrame) -> pd.Series:
+    vol = window.std(skipna=True)
+    inv_vol = 1.0 / vol.replace(0.0, np.nan)
+    inv_vol = inv_vol.dropna()
+    if inv_vol.empty:
+        return pd.Series(dtype=float)
+    weights = inv_vol / inv_vol.sum()
+    return weights
+
+
+def _min_variance_weights(window: pd.DataFrame) -> pd.Series:
+    cov = window.cov()
+    if cov.empty:
+        return pd.Series(dtype=float)
+    inv_cov = np.linalg.pinv(cov.values)
+    ones = np.ones(inv_cov.shape[0])
+    raw = inv_cov @ ones
+    if np.all(np.isnan(raw)):
+        return pd.Series(dtype=float)
+    raw = np.clip(raw, 0.0, None)
+    if raw.sum() == 0.0:
+        return pd.Series(dtype=float)
+    weights = raw / raw.sum()
+    return pd.Series(weights, index=cov.columns)
+
+
 def _select_top_k(scores: pd.Series, k: int, low_is_best: bool) -> list[str]:
     scores = scores.dropna()
     if scores.empty:
@@ -65,6 +91,7 @@ def build_weights(
         idx = dates.get_loc(date)
         if params.strategy == "equal_weight":
             selected = returns_wide.columns.tolist()
+            weights = None
         else:
             if idx < params.lookback:
                 continue
@@ -72,21 +99,33 @@ def build_weights(
             if params.strategy == "momentum_top_k":
                 scores = _momentum_scores(window)
                 selected = _select_top_k(scores, params.k, low_is_best=False)
+                weights = None
             elif params.strategy == "low_vol_top_k":
                 scores = _low_vol_scores(window)
                 selected = _select_top_k(scores, params.k, low_is_best=True)
+                weights = None
             elif params.strategy == "sharpe_top_k":
                 scores = _sharpe_scores(window)
                 selected = _select_top_k(scores, params.k, low_is_best=False)
+                weights = None
+            elif params.strategy == "risk_parity":
+                weights = _risk_parity_weights(window)
+                selected = weights.index.tolist()
+            elif params.strategy == "min_variance":
+                weights = _min_variance_weights(window)
+                selected = weights.index.tolist()
             else:
                 raise ValueError(f"Unknown strategy: {params.strategy}")
 
         if not selected:
             continue
-        weight = 1.0 / len(selected)
-        weights_by_date[pd.Timestamp(date)] = pd.Series(
-            weight, index=selected, name="weight"
-        )
+        if weights is None:
+            weight = 1.0 / len(selected)
+            weights_by_date[pd.Timestamp(date)] = pd.Series(
+                weight, index=selected, name="weight"
+            )
+        else:
+            weights_by_date[pd.Timestamp(date)] = weights.rename("weight")
 
     if not weights_by_date:
         return pd.DataFrame(), pd.DataFrame()
