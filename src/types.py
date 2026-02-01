@@ -22,7 +22,14 @@ class FetchParams:
 class StrategyParams:
     k: int = 100  # kaç fon seçilecek
     seed: int = 42
-    rebalance: Literal["none"] = "none"  # sprint2: tek dönem, rebalance yok
+    strategy: Literal[
+        "equal_weight",
+        "momentum_top_k",
+        "low_vol_top_k",
+        "sharpe_top_k",
+    ] = "equal_weight"
+    lookback: int = 20
+    rebalance: Literal["daily", "weekly", "monthly"] = "monthly"
 
 
 @dataclass(frozen=True)

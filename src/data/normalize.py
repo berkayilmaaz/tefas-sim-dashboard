@@ -41,7 +41,10 @@ def normalize_prices(df: pd.DataFrame) -> pd.DataFrame:
         )
 
     # 4️⃣ tip normalize
-    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
+    df["date"] = (
+        pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+        .dt.normalize()
+    )
     df["fund_code"] = df["fund_code"].astype(str)
     df["fund_name"] = df["fund_name"].astype(str)
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
