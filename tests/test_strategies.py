@@ -13,6 +13,6 @@ def test_equal_weight():
             "ret": [0.01, 0.03, 0.02, 0.00],
         }
     )
-    s = equal_weight_portfolio(df, StrategyParams(k=2, seed=1))
+    s = equal_weight_portfolio(df, StrategyParams(k=2, seed=1, rebalance="daily"))
     assert len(s) == 2
     assert abs(s.iloc[0] - 0.02) < 1e-9
