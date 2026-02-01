@@ -18,8 +18,12 @@ class TefasLibProvider:
         cache_key = f"{self.name}|{params.universe}|{params.start}|{params.end}"
         cached = load_parquet(cache_key)
         if cached is not None and len(cached) > 0:
-            # cached is already normalized when we save it, but normalize again is safe
-            return normalize_prices(cached, category=self.name)
+            # Cached data is expected to already be normalized.
+            # normalize again is safe BUT don't pass category kwarg.
+            if "category" not in cached.columns:
+                cached = cached.copy()
+                cached["category"] = self._category_label(params.universe)
+            return normalize_prices(cached)
 
         try:
             from tefasfon import fetch_tefas_data
@@ -37,22 +41,30 @@ class TefasLibProvider:
 
         df = pd.DataFrame(raw)
 
-        # tefasfon usually returns:
-        # ['date','fund_code','fund_name','Fiyat','Tedavüldeki Pay Sayısı','Kişi Sayısı','Fon Toplam Değer']
-        # normalize_prices will map 'Fiyat' -> 'price' etc.
-        out = normalize_prices(df, category=params.universe)
+        # Add category as a COLUMN (normalize_prices does not accept category= kwarg)
+        if "category" not in df.columns:
+            df["category"] = self._category_label(params.universe)
+
+        # normalize_prices will handle mapping TR columns like 'Fiyat' -> 'price'
+        out = normalize_prices(df)
 
         save_parquet(cache_key, out)
         return out
+
+    @staticmethod
+    def _category_label(universe: str) -> str:
+        # what we store in the 'category' column
+        u = (universe or "").strip()
+        return u if u else "tefasfon"
 
     @staticmethod
     def _fund_type_code(universe: str) -> int:
         """
         Map our universe name -> tefasfon fund_type_code.
 
-        NOTE: You saw valid codes: [0,1,2,3,4]
-        We'll start with a sane default:
-        - "serbest": 4 (your assumption; if wrong we'll brute-force map later)
+        Valid codes observed: [0,1,2,3,4]
+        We'll start with:
+        - "serbest": 4
         - else: 0
         """
         u = (universe or "").lower().strip()
@@ -66,6 +78,5 @@ class TefasLibProvider:
         Map our universe name -> tefasfon tab_code.
 
         We'll keep default 0 for now.
-        If you want more tabs later, we can expose this in UI.
         """
         return 0
