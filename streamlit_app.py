@@ -3,7 +3,7 @@ import numpy as np
 import plotly.express as px
 import streamlit as st
 
-from src.data.provider_tefaslib import TefasLibProvider
+from src.data import loader
 from src.domain.correlation import correlation_matrix, correlation_pairs
 from src.domain.returns import compute_fund_daily_returns
 from src.domain.stats import (
@@ -21,7 +21,7 @@ from src.domain.strategies import (
     backtest_portfolio_assets,  # YENİ EKLENDİ
     select_universe_k,
 )
-from src.types import FetchParams, StrategyParams
+from src.types import StrategyParams
 from src.viz.plots import (
     plot_correlation_heatmap,
     plot_drawdown,
@@ -33,19 +33,11 @@ from src.viz.plots import (
 
 st.set_page_config(page_title="TEFAS Simülasyonu", layout="wide")
 
+metadata = loader.get_metadata()
 
 # -----------------------------------------------------------------------------
 # DATA LOADERS
 # -----------------------------------------------------------------------------
-@st.cache_data(show_spinner=False)
-def load_prices(
-    provider_name: str, start: str, end: str, universe: str
-) -> pd.DataFrame:
-    provider = TefasLibProvider()
-    params = FetchParams(start=start, end=end, universe=universe)
-    return provider.fetch_prices(params)
-
-
 @st.cache_data(show_spinner=False)
 def summarize_funds(prices: pd.DataFrame) -> pd.DataFrame:
     prices = prices.sort_values(["fund_code", "date"])
@@ -71,16 +63,6 @@ def summarize_funds(prices: pd.DataFrame) -> pd.DataFrame:
         summary[col] = pd.to_numeric(summary[col], errors="coerce").fillna(0.0)
     summary["missing_days"] = expected_days - summary["obs_days"]
     return summary
-
-
-def parse_date(value: str) -> pd.Timestamp | None:
-    try:
-        parsed = pd.to_datetime(value, dayfirst=True, errors="coerce")
-    except Exception:
-        return None
-    if pd.isna(parsed):
-        return None
-    return parsed.normalize()
 
 
 def select_funds(
@@ -120,11 +102,58 @@ def select_funds(
 # -----------------------------------------------------------------------------
 st.sidebar.header("Girdiler")
 
-start_input = st.sidebar.text_input("Başlangıç (gg.aa.yyyy)", value="01.12.2025")
-end_input = st.sidebar.text_input("Bitiş (gg.aa.yyyy)", value="01.01.2026")
+last_updated = metadata.get("last_updated", "Bilinmiyor")
+st.sidebar.caption(f"Veriler en son {last_updated} tarihinde güncellendi.")
 
-provider_name = "tefasfon"
-universe = st.sidebar.selectbox("Evren", options=["free"], index=0)
+if not loader.MASTER_PATH.exists():
+    st.error(
+        "Veri dosyası bulunamadı. Lütfen `python -m scripts.update_data` komutunu çalıştırın."
+    )
+    st.stop()
+
+master_data = loader.load_master_data()
+macro_data = loader.load_macro_data()
+master_data["date"] = pd.to_datetime(master_data["date"], errors="coerce")
+min_date = master_data["date"].min().date()
+max_date = master_data["date"].max().date()
+
+date_range = st.sidebar.date_input(
+    "Tarih Aralığı",
+    value=(min_date, max_date),
+    min_value=min_date,
+    max_value=max_date,
+)
+if isinstance(date_range, tuple):
+    start_date_input, end_date_input = date_range
+else:
+    start_date_input = date_range
+    end_date_input = date_range
+
+fund_type_options = (
+    master_data["category"]
+    .dropna()
+    .astype(str)
+    .sort_values()
+    .unique()
+    .tolist()
+)
+selected_fund_types = st.sidebar.multiselect(
+    "Fon Türü",
+    options=fund_type_options,
+)
+
+fund_code_options = (
+    master_data["fund_code"]
+    .dropna()
+    .astype(str)
+    .sort_values()
+    .unique()
+    .tolist()
+)
+selected_fund_codes = st.sidebar.multiselect(
+    "Fon Kodu",
+    options=fund_code_options,
+)
 
 st.sidebar.subheader("Sermaye Yönetimi (YENİ)")
 per_fund_capital = st.sidebar.number_input(
@@ -147,7 +176,7 @@ k = st.sidebar.slider("K (Fon Sayısı)", min_value=10, max_value=500, value=50)
 
 selection_mode = st.sidebar.radio(
     "Havuz Seçimi",
-    options=["AUM’a göre ilk K", "Rastgele K", "Manuel"],
+    options=["AUM’a göre ilk K", "Rastgele K", "Manuel (fon kodlarını seç)"],
     index=0,
 )
 
@@ -197,17 +226,23 @@ if st.sidebar.button("Önbelleği temizle"):
 # -----------------------------------------------------------------------------
 st.title("TEFAS Simülasyon & İstatistik Laboratuvarı")
 
-start_date = parse_date(start_input)
-end_date = parse_date(end_input)
+start_date = pd.Timestamp(start_date_input)
+end_date = pd.Timestamp(end_date_input)
 
-if not start_date or not end_date:
-    st.error("Lütfen tarihleri kontrol edin.")
+if start_date > end_date:
+    st.error("Lütfen tarih aralığını kontrol edin.")
     st.stop()
 
 # 1. VERİ ÇEKME
 with st.spinner("Veriler çekiliyor..."):
     try:
-        prices = load_prices(provider_name, start_input, end_input, universe)
+        prices = loader.filter_data(
+            master_data,
+            start_date,
+            end_date,
+            selected_fund_codes,
+            selected_fund_types,
+        )
     except Exception as exc:
         st.error(f"Veri hatası: {exc}")
         st.stop()
@@ -230,6 +265,8 @@ if filtered_summary.empty:
     st.stop()
 
 manual_codes = []  # (Basitlik için manuel kısmı kısalttım, gerekirse eklenebilir)
+if selection_mode == "Manuel (fon kodlarını seç)":
+    manual_codes = selected_fund_codes
 selected_funds, missing = select_funds(
     filtered_summary, selection_mode, int(k), int(seed), manual_codes
 )
@@ -384,13 +421,69 @@ with tab_monte:
 
 with tab_metrics:
     st.subheader("Detaylı Metrikler")
+    macro_ready = not macro_data.empty and {
+        "date",
+        "usdtry",
+        "cpi_us",
+        "cpi_tr",
+    }.issubset(set(macro_data.columns))
+    if not macro_ready:
+        st.info(
+            "Makro veri bulunamadı. USD/TRY veya TÜFE ayarlamaları için `python -m scripts.update_data` çalıştırın."
+        )
+
+    use_usd = st.toggle("USD Bazlı Getiri", value=False)
+    use_real = st.toggle("Enflasyondan Arındır (Reel Getiri)", value=False)
+
+    adjusted_equity = strategy_equity.copy()
+    macro_aligned = pd.DataFrame()
+    if macro_ready:
+        macro_aligned = macro_data.copy()
+        macro_aligned["date"] = pd.to_datetime(macro_aligned["date"], errors="coerce")
+        macro_aligned = macro_aligned.set_index("date").sort_index()
+        macro_aligned = macro_aligned.reindex(adjusted_equity.index).ffill()
+
+        if use_usd:
+            adjusted_equity = adjusted_equity / macro_aligned["usdtry"]
+
+        if use_real:
+            cpi_series = macro_aligned["cpi_us"] if use_usd else macro_aligned["cpi_tr"]
+            inflation_index = cpi_series / cpi_series.iloc[0]
+            adjusted_equity = adjusted_equity / inflation_index
+
+    adjusted_returns = adjusted_equity.pct_change().fillna(0.0)
+
     # Rolling Metrics
-    rolling_df = rolling_metrics(strategy_returns, window=30)
+    rolling_df = rolling_metrics(adjusted_returns, window=30)
     st.plotly_chart(plot_rolling_metrics(rolling_df, None), use_container_width=True)
 
     # Drawdown
-    dd_series = drawdown_series(strategy_equity)
+    dd_series = drawdown_series(adjusted_equity)
     st.plotly_chart(plot_drawdown(dd_series), use_container_width=True)
+
+    if macro_ready and st.checkbox("Karşılaştırma çizgilerini göster"):
+        comparison_frames = []
+        equity_norm = adjusted_equity / adjusted_equity.iloc[0]
+        comparison_frames.append(
+            equity_norm.rename("equity").to_frame().assign(fund_code="Strateji")
+        )
+        usdtry_norm = macro_aligned["usdtry"] / macro_aligned["usdtry"].iloc[0]
+        comparison_frames.append(
+            usdtry_norm.rename("equity").to_frame().assign(fund_code="USD/TRY")
+        )
+        cpi_base = macro_aligned["cpi_us"] if use_usd else macro_aligned["cpi_tr"]
+        cpi_norm = cpi_base / cpi_base.iloc[0]
+        comparison_frames.append(
+            cpi_norm.rename("equity").to_frame().assign(fund_code="TÜFE")
+        )
+        comparison_df = (
+            pd.concat(comparison_frames)
+            .reset_index()
+            .rename(columns={"index": "date"})
+        )
+        st.plotly_chart(
+            plot_equity_comparison(comparison_df), use_container_width=True
+        )
 
     # Fon Özeti Tablosu
     st.dataframe(filtered_summary)

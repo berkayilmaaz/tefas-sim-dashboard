@@ -4,6 +4,16 @@ from __future__ import annotations
 import pandas as pd
 
 REQUIRED = ["date", "fund_code", "fund_name", "price"]
+OPTIONAL = [
+    "shares_outstanding",
+    "investor_count",
+    "aum",
+    "category",
+    "allocation_stock",
+    "allocation_bond",
+    "allocation_cash",
+    "allocation_fx",
+]
 
 # TEFAS → canonical mapping
 COLUMN_MAP = {
@@ -50,7 +60,7 @@ def normalize_prices(df: pd.DataFrame) -> pd.DataFrame:
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
 
     # 5️⃣ opsiyonel kolonlar yoksa ekle
-    for col in ["shares_outstanding", "investor_count", "aum", "category"]:
+    for col in OPTIONAL:
         if col not in df.columns:
             df[col] = None
 
