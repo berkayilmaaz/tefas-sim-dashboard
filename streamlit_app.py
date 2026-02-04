@@ -1,48 +1,48 @@
 import pandas as pd
+import numpy as np
+import plotly.express as px
 import streamlit as st
 
-from src.data.provider_tefaslib import TefasLibProvider
+from src.data import loader
+from src.domain.correlation import correlation_matrix, correlation_pairs
 from src.domain.returns import compute_fund_daily_returns
 from src.domain.stats import (
     annualized_vol,
     drawdown_series,
     equity_curve,
     max_drawdown,
+    rolling_metrics,
     sharpe,
     total_return,
+    check_normality,  # YENİ EKLENDİ
 )
 from src.domain.strategies import (
     build_weights,
-    compute_portfolio_returns,
+    backtest_portfolio_assets,  # YENİ EKLENDİ
     select_universe_k,
 )
-from src.types import FetchParams, StrategyParams
-from src.viz.plots import plot_drawdown, plot_equity
+from src.types import StrategyParams
+from src.viz.plots import (
+    plot_correlation_heatmap,
+    plot_drawdown,
+    plot_equity,
+    plot_equity_comparison,
+    plot_return_histogram,
+    plot_rolling_metrics,
+)
 
-st.set_page_config(page_title="TEFAS Strategy Simulator", layout="wide")
+st.set_page_config(page_title="TEFAS Simülasyonu", layout="wide")
 
+metadata = loader.get_metadata()
 
+# -----------------------------------------------------------------------------
+# DATA LOADERS
+# -----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
-def load_prices(provider_name: str, start: str, end: str, universe: str) -> pd.DataFrame:
-    provider = TefasLibProvider()
-    params = FetchParams(start=start, end=end, universe=universe)
-    return provider.fetch_prices(params)
-
-
-def parse_date(value: str) -> pd.Timestamp | None:
-    try:
-        parsed = pd.to_datetime(value, dayfirst=True, errors="coerce")
-    except Exception:
-        return None
-    if pd.isna(parsed):
-        return None
-    return parsed.normalize()
-
-
 def summarize_funds(prices: pd.DataFrame) -> pd.DataFrame:
     prices = prices.sort_values(["fund_code", "date"])
     returns = compute_fund_daily_returns(prices)
-    vol = returns.groupby("fund_code")["ret"].std(ddof=1)
+    ret_group = returns.groupby("fund_code")["ret"]
 
     expected_days = prices["date"].nunique()
 
@@ -56,13 +56,12 @@ def summarize_funds(prices: pd.DataFrame) -> pd.DataFrame:
         obs_days=("date", "nunique"),
     )
     summary["period_return"] = summary["end_price"] / summary["start_price"] - 1.0
-    summary["vol_daily"] = vol
-    summary["missing_days"] = expected_days - summary["obs_days"]
+    summary["vol_daily"] = ret_group.std(ddof=1)
     summary = summary.reset_index()
-    summary["aum_last"] = pd.to_numeric(summary["aum_last"], errors="coerce").fillna(0.0)
-    summary["price_last"] = pd.to_numeric(summary["price_last"], errors="coerce")
-    summary["start_price"] = pd.to_numeric(summary["start_price"], errors="coerce")
-    summary["end_price"] = pd.to_numeric(summary["end_price"], errors="coerce")
+    # Numeric conversion
+    for col in ["aum_last", "price_last", "start_price", "end_price"]:
+        summary[col] = pd.to_numeric(summary[col], errors="coerce").fillna(0.0)
+    summary["missing_days"] = expected_days - summary["obs_days"]
     return summary
 
 
@@ -76,17 +75,17 @@ def select_funds(
     fund_codes = summary["fund_code"].tolist()
     missing_manual = []
 
-    if mode == "Top-K by AUM":
+    if mode == "AUM’a göre ilk K":
         selected = (
             summary.sort_values("aum_last", ascending=False)
             .head(k)["fund_code"]
             .tolist()
         )
         return selected, missing_manual
-    if mode == "Random K":
+    if mode == "Rastgele K":
         selected = select_universe_k(fund_codes, k, seed)
         return selected, missing_manual
-    if mode == "Manual":
+    if mode == "Manuel (fon kodlarını seç)":
         code_set = set(fund_codes)
         selected = []
         for code in manual_codes:
@@ -98,323 +97,336 @@ def select_funds(
     return fund_codes, missing_manual
 
 
-def build_benchmark(
-    prices: pd.DataFrame,
-    benchmark_mode: str,
-    strategy_params: StrategyParams,
-) -> tuple[pd.Series, pd.DataFrame]:
-    summary = summarize_funds(prices)
-    if benchmark_mode == "Equal-weight (Top AUM 200)":
-        chosen = (
-            summary.sort_values("aum_last", ascending=False)
-            .head(200)["fund_code"]
-            .tolist()
-        )
-    else:
-        chosen = summary["fund_code"].tolist()
+# -----------------------------------------------------------------------------
+# SIDEBAR
+# -----------------------------------------------------------------------------
+st.sidebar.header("Girdiler")
 
-    bench_prices = prices[prices["fund_code"].isin(chosen)]
-    bench_returns = compute_fund_daily_returns(bench_prices)
-    bench_wide = bench_returns.pivot_table(
-        index="date", columns="fund_code", values="ret", aggfunc="mean"
-    ).sort_index()
-    weights_daily, weights_table = build_weights(bench_wide, strategy_params)
-    bench_ret = compute_portfolio_returns(bench_wide, weights_daily)
-    return bench_ret, weights_table
+last_updated = metadata.get("last_updated", "Bilinmiyor")
+st.sidebar.caption(f"Veriler en son {last_updated} tarihinde güncellendi.")
 
+if not loader.MASTER_PATH.exists():
+    st.error(
+        "Veri dosyası bulunamadı. Lütfen `python -m scripts.update_data` komutunu çalıştırın."
+    )
+    st.stop()
 
-st.title("TEFAS Strategy Simulator (Sprint 3)")
+master_data = loader.load_master_data()
+master_data["date"] = pd.to_datetime(master_data["date"], errors="coerce")
+min_date = master_data["date"].min().date()
+max_date = master_data["date"].max().date()
 
-# Sidebar inputs
-st.sidebar.header("Inputs")
+date_range = st.sidebar.date_input(
+    "Tarih Aralığı",
+    value=(min_date, max_date),
+    min_value=min_date,
+    max_value=max_date,
+)
+if isinstance(date_range, tuple):
+    start_date_input, end_date_input = date_range
+else:
+    start_date_input = date_range
+    end_date_input = date_range
 
-start_input = st.sidebar.text_input("Start (dd.mm.yyyy)", value="01.01.2025")
-end_input = st.sidebar.text_input("End (dd.mm.yyyy)", value="15.01.2025")
+fund_type_options = (
+    master_data["category"]
+    .dropna()
+    .astype(str)
+    .sort_values()
+    .unique()
+    .tolist()
+)
+selected_fund_types = st.sidebar.multiselect(
+    "Fon Türü",
+    options=fund_type_options,
+)
 
-provider_name = "tefasfon"
-universe = st.sidebar.selectbox("Universe", options=["free"], index=0)
+fund_code_options = (
+    master_data["fund_code"]
+    .dropna()
+    .astype(str)
+    .sort_values()
+    .unique()
+    .tolist()
+)
+selected_fund_codes = st.sidebar.multiselect(
+    "Fon Kodu",
+    options=fund_code_options,
+)
 
-k = st.sidebar.slider("K (number of funds)", min_value=10, max_value=500, value=200)
+st.sidebar.subheader("Sermaye Yönetimi (YENİ)")
+per_fund_capital = st.sidebar.number_input(
+    "Fon Başına Başlangıç (TL)", value=1000.0, step=100.0
+)
+
+st.sidebar.subheader("Fon Filtresi")
+min_aum = st.sidebar.number_input(
+    "Minimum AUM (son gün)", min_value=0.0, value=0.0, step=1_000_000.0
+)
+min_obs_days = st.sidebar.number_input(
+    "Minimum gözlem günü", min_value=1, value=60, step=1
+)
+missing_tolerance = st.sidebar.number_input(
+    "Eksik gün toleransı", min_value=0, value=5, step=1
+)
+
+st.sidebar.subheader("Strateji Seçimi")
+k = st.sidebar.slider("K (Fon Sayısı)", min_value=10, max_value=500, value=50)
+
 selection_mode = st.sidebar.radio(
-    "Selection mode",
-    options=["Top-K by AUM", "Random K", "Manual"],
+    "Havuz Seçimi",
+    options=["AUM’a göre ilk K", "Rastgele K", "Manuel (fon kodlarını seç)"],
     index=0,
 )
 
 seed = 42
-if selection_mode == "Random K":
+if selection_mode == "Rastgele K":
     seed = st.sidebar.number_input(
-        "Random seed", min_value=0, max_value=10_000, value=42, step=1
+        "Random Seed", min_value=0, max_value=10000, value=42
     )
 
-manual_codes: list[str] = []
-if selection_mode == "Manual":
-    raw_codes = st.sidebar.text_area("Fund codes (comma separated)")
-    manual_codes = [
-        code.strip().upper() for code in raw_codes.replace("\n", ",").split(",")
-        if code.strip()
-    ]
-    if manual_codes:
-        k = len(manual_codes)
-
 strategy_label = st.sidebar.selectbox(
-    "Strategy",
+    "Ağırlıklandırma Stratejisi",
     options=[
-        "Equal Weight",
+        "Eşit Ağırlık",
         "Momentum Top-K",
-        "Low Vol Top-K",
+        "Düşük Vol Top-K",
         "Sharpe Top-K",
+        "Risk Parity (basit)",
+        "Min Variance (baseline)",
     ],
     index=0,
 )
 
 strategy_map = {
-    "Equal Weight": "equal_weight",
+    "Eşit Ağırlık": "equal_weight",
     "Momentum Top-K": "momentum_top_k",
-    "Low Vol Top-K": "low_vol_top_k",
+    "Düşük Vol Top-K": "low_vol_top_k",
     "Sharpe Top-K": "sharpe_top_k",
+    "Risk Parity (basit)": "risk_parity",
+    "Min Variance (baseline)": "min_variance",
 }
-
 strategy_key = strategy_map[strategy_label]
+
 lookback = 20
 if strategy_key != "equal_weight":
-    lookback = st.sidebar.slider(
-        "Lookback (days)", min_value=5, max_value=252, value=20
-    )
+    lookback = st.sidebar.slider("Geriye bakış (gün)", 5, 252, 20)
 
 rebalance = st.sidebar.selectbox(
-    "Rebalance frequency", options=["daily", "weekly", "monthly"], index=2
+    "Rebalance Sıklığı", ["daily", "weekly", "monthly"], index=2
 )
 
-show_benchmark = st.sidebar.checkbox("Show benchmark", value=True)
-benchmark_mode = st.sidebar.selectbox(
-    "Benchmark",
-    options=["Equal-weight (Top AUM 200)", "Equal-weight (All selected universe)"],
-    index=0,
-)
-
-debug_mode = st.sidebar.checkbox("Debug mode: show raw tables", value=False)
-if st.sidebar.button("Clear cache"):
+if st.sidebar.button("Önbelleği temizle"):
     st.cache_data.clear()
-    st.sidebar.success("Cache cleared")
+    st.sidebar.success("Temizlendi.")
 
-start_date = parse_date(start_input)
-end_date = parse_date(end_input)
-if start_date is None or end_date is None:
-    st.error("Invalid date input. Use dd.mm.yyyy format.")
-    st.stop()
+# -----------------------------------------------------------------------------
+# MAIN LOGIC
+# -----------------------------------------------------------------------------
+st.title("TEFAS Simülasyon & İstatistik Laboratuvarı")
+
+start_date = pd.Timestamp(start_date_input)
+end_date = pd.Timestamp(end_date_input)
+
 if start_date > end_date:
-    st.error("Start date must be earlier than end date.")
+    st.error("Lütfen tarih aralığını kontrol edin.")
     st.stop()
 
-st.caption(
-    f"Provider: {provider_name} | Universe: {universe} | Date range: {start_input} – {end_input}"
-)
-
-try:
-    prices = load_prices(provider_name, start_input, end_input, universe)
-except Exception as exc:
-    st.error("Data fetch failed.")
-    st.code(str(exc))
-    st.stop()
+# 1. VERİ ÇEKME
+with st.spinner("Veriler çekiliyor..."):
+    try:
+        prices = loader.filter_data(
+            master_data,
+            start_date,
+            end_date,
+            selected_fund_codes,
+            selected_fund_types,
+        )
+    except Exception as exc:
+        st.error(f"Veri hatası: {exc}")
+        st.stop()
 
 if prices.empty:
-    st.error("No data in selected date range.")
+    st.warning("Veri yok.")
     st.stop()
 
+# 2. FİLTRELEME & SEÇİM
 summary_all = summarize_funds(prices)
-selected_funds, missing_manual = select_funds(
-    summary_all, selection_mode, int(k), int(seed), manual_codes
+filtered_summary = summary_all.copy()
+filtered_summary = filtered_summary[filtered_summary["aum_last"] >= min_aum]
+filtered_summary = filtered_summary[filtered_summary["obs_days"] >= min_obs_days]
+filtered_summary = filtered_summary[
+    filtered_summary["missing_days"] <= missing_tolerance
+]
+
+if filtered_summary.empty:
+    st.error("Filtrelere uygun fon bulunamadı.")
+    st.stop()
+
+manual_codes = []  # (Basitlik için manuel kısmı kısalttım, gerekirse eklenebilir)
+if selection_mode == "Manuel (fon kodlarını seç)":
+    manual_codes = selected_fund_codes
+selected_funds, missing = select_funds(
+    filtered_summary, selection_mode, int(k), int(seed), manual_codes
 )
 
-if missing_manual:
-    st.warning(f"Some fund codes not found: {', '.join(missing_manual)}")
-
 if not selected_funds:
-    st.error("No funds selected. Adjust selection mode or inputs.")
+    st.error("Fon seçilemedi.")
     st.stop()
 
+# Seçilen fon sayısı gerçekte mevcut olandan az olabilir
+actual_k = len(selected_funds)
+initial_capital = actual_k * per_fund_capital
+
+st.info(
+    f"**Simülasyon Ayarları:** {actual_k} fon seçildi. Fon başı {per_fund_capital:,.0f} TL. Toplam Sermaye: **{initial_capital:,.0f} TL**"
+)
+
+# 3. BACKTEST
 selected_prices = prices[prices["fund_code"].isin(selected_funds)]
-
-summary_selected = summary_all[summary_all["fund_code"].isin(selected_funds)].copy()
-if selection_mode == "Top-K by AUM":
-    summary_selected = summary_selected.sort_values("aum_last", ascending=False)
-elif selection_mode == "Random K":
-    summary_selected = summary_selected.sort_values("fund_code")
-elif selection_mode == "Manual":
-    order = {code: idx for idx, code in enumerate(selected_funds)}
-    summary_selected["_order"] = summary_selected["fund_code"].map(order)
-    summary_selected = summary_selected.sort_values("_order").drop(columns=["_order"])
-
 returns_long = compute_fund_daily_returns(selected_prices)
 returns_wide = returns_long.pivot_table(
     index="date", columns="fund_code", values="ret", aggfunc="mean"
 ).sort_index()
 
-if strategy_key != "equal_weight" and lookback >= len(returns_wide.index):
-    st.warning("Not enough lookback days. Increase date range or reduce lookback.")
-    st.stop()
-
+# Strateji Parametreleri
 strategy_params = StrategyParams(
-    k=int(k),
+    k=actual_k,  # Seçilen havuzun tamamını kullanıyoruz
     seed=int(seed),
     strategy=strategy_key,
-    lookback=int(lookback),
+    lookback=lookback,
     rebalance=rebalance,
 )
 
+# Ağırlık Hesapla
 weights_daily, weights_table = build_weights(returns_wide, strategy_params)
-if weights_daily.empty:
-    st.warning("Not enough lookback days. Increase date range or reduce lookback.")
+
+# YENİ: Gerçekçi Backtest Motorunu Çağır
+prices_wide = selected_prices.pivot(index="date", columns="fund_code", values="price")
+df_results = backtest_portfolio_assets(prices_wide, weights_table, initial_capital)
+
+if df_results.empty:
+    st.error("Backtest hesaplanamadı. Tarih aralığını veya verileri kontrol edin.")
     st.stop()
 
-strategy_returns = compute_portfolio_returns(returns_wide, weights_daily)
-strategy_equity = equity_curve(strategy_returns, start_value=1.0)
-strategy_drawdown = drawdown_series(strategy_equity)
+strategy_equity = df_results["equity"]  # TL değeri
+strategy_returns = df_results["ret"]  # Günlük % getiri
 
-benchmark_returns = pd.Series(dtype=float)
-benchmark_equity = pd.Series(dtype=float)
-benchmark_drawdown = pd.Series(dtype=float)
-if show_benchmark:
-    benchmark_returns, _ = build_benchmark(prices, benchmark_mode, strategy_params)
-    if not benchmark_returns.empty:
-        benchmark_equity = equity_curve(benchmark_returns, start_value=1.0)
-        benchmark_drawdown = drawdown_series(benchmark_equity)
+# 4. SONUÇLAR
+final_value = strategy_equity.iloc[-1]
+net_profit = final_value - initial_capital
+total_ret_pct = net_profit / initial_capital
 
-st.subheader("Funds Summary (1 row per fund)")
-show_all = st.checkbox("Show all funds", value=False)
-summary_display = summary_selected.copy()
-summary_display = summary_display[
-    [
-        "fund_code",
-        "fund_name",
-        "aum_last",
-        "price_last",
-        "start_price",
-        "end_price",
-        "period_return",
-        "vol_daily",
-        "missing_days",
-        "obs_days",
-    ]
-]
-if not show_all:
-    summary_display = summary_display.head(50)
+col1, col2, col3 = st.columns(3)
+col1.metric("Başlangıç Sermayesi", f"{initial_capital:,.0f} TL")
+col2.metric("Bitiş Sermayesi", f"{final_value:,.0f} TL", f"%{total_ret_pct*100:.2f}")
+col3.metric("Net Kâr/Zarar", f"{net_profit:,.0f} TL")
 
-st.dataframe(summary_display, use_container_width=True)
-
-st.subheader("Performance (Strategy vs Benchmark)")
-
-str_cols = st.columns(4)
-str_cols[0].metric("Total Return", f"{total_return(strategy_equity) * 100:.2f}%")
-str_cols[1].metric("Vol (ann.)", f"{annualized_vol(strategy_returns) * 100:.2f}%")
-str_cols[2].metric("Max Drawdown", f"{max_drawdown(strategy_equity) * 100:.2f}%")
-str_cols[3].metric("Sharpe", f"{sharpe(strategy_returns):.2f}")
-
-if show_benchmark and not benchmark_returns.empty:
-    bench_cols = st.columns(4)
-    bench_cols[0].metric(
-        "Benchmark Total Return", f"{total_return(benchmark_equity) * 100:.2f}%"
-    )
-    bench_cols[1].metric(
-        "Benchmark Vol (ann.)", f"{annualized_vol(benchmark_returns) * 100:.2f}%"
-    )
-    bench_cols[2].metric(
-        "Benchmark Max Drawdown", f"{max_drawdown(benchmark_equity) * 100:.2f}%"
-    )
-    bench_cols[3].metric("Benchmark Sharpe", f"{sharpe(benchmark_returns):.2f}")
-
-st.subheader("Equity Curve")
-st.caption(f"Rebalance frequency: {rebalance} | Lookback: {lookback} days")
+# GRAFİKLER
+st.subheader("Portföy Değeri (TL)")
+# Mevcut plot fonksiyonu normalize edilmiş (1.0'dan başlayan) equity bekliyor,
+# O yüzden grafiği çizerken normalize edip gönderiyoruz
 st.plotly_chart(
-    plot_equity(strategy_equity, benchmark_equity if show_benchmark else None),
-    use_container_width=True,
+    plot_equity(strategy_equity / initial_capital), use_container_width=True
 )
 
-st.subheader("Drawdown")
-st.plotly_chart(
-    plot_drawdown(strategy_drawdown, benchmark_drawdown if show_benchmark else None),
-    use_container_width=True,
+# İSTATİSTİK & MONTE CARLO SEKMELERİ
+tab_stats, tab_monte, tab_metrics = st.tabs(
+    ["📊 İstatistiksel Analiz", "🎲 Monte Carlo Simülasyonu", "📈 Metrikler & Tablo"]
 )
 
-st.subheader("Portfolio Daily Returns")
-show_full_returns = st.checkbox("Show full table", value=False)
-returns_table = strategy_returns.reset_index().rename(
-    columns={"date": "date", "portfolio_ret": "ret"}
-)
-if not show_full_returns:
-    returns_table = returns_table.tail(30)
-st.dataframe(returns_table, use_container_width=True)
+with tab_stats:
+    st.subheader("Normallik ve Kuyruk Riski Analizi")
+    st.markdown("Getirilerin istatistiksel dağılımı (Fizikçi Gözüyle):")
 
-st.subheader("Weights (rebalance dates)")
-if weights_table.empty:
-    st.write("No rebalance weights available.")
-else:
-    st.dataframe(weights_table, use_container_width=True)
+    norm_res = check_normality(strategy_returns)
 
-st.subheader("Download")
-
-summary_csv = summary_selected.to_csv(index=False).encode("utf-8")
-returns_csv = (
-    strategy_returns.reset_index()
-    .rename(columns={"portfolio_ret": "ret"})
-    .assign(
-        equity=strategy_equity.values,
-        drawdown=strategy_drawdown.values,
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    sc1.metric(
+        "Normal Dağılım mı?",
+        "EVET" if norm_res["is_normal"] else "HAYIR",
+        help="p-value > 0.05 ise Normal kabul edilir.",
     )
-    .to_csv(index=False)
-    .encode("utf-8")
-)
-
-st.download_button(
-    "Download funds_summary.csv",
-    data=summary_csv,
-    file_name="funds_summary.csv",
-    mime="text/csv",
-)
-
-st.download_button(
-    "Download strategy_returns.csv",
-    data=returns_csv,
-    file_name="strategy_returns.csv",
-    mime="text/csv",
-)
-
-if show_benchmark and not benchmark_returns.empty:
-    bench_csv = (
-        benchmark_returns.reset_index()
-        .rename(columns={"portfolio_ret": "ret"})
-        .assign(
-            equity=benchmark_equity.values,
-            drawdown=benchmark_drawdown.values,
-        )
-        .to_csv(index=False)
-        .encode("utf-8")
+    sc2.metric("p-value", f"{norm_res['p_value']:.4f}")
+    sc3.metric(
+        "Çarpıklık (Skew)",
+        f"{norm_res['skew']:.2f}",
+        help="Negatif skew = Ani çöküş riski (Sol kuyruk).",
     )
-    st.download_button(
-        "Download benchmark_returns.csv",
-        data=bench_csv,
-        file_name="benchmark_returns.csv",
-        mime="text/csv",
+    sc4.metric(
+        "Basıklık (Kurtosis)",
+        f"{norm_res['kurtosis']:.2f}",
+        help="Yüksek değer = 'Fat Tail' (Siyah Kuğu) olasılığı.",
     )
 
-if not weights_table.empty:
-    weights_csv = weights_table.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download weights.csv",
-        data=weights_csv,
-        file_name="weights.csv",
-        mime="text/csv",
+    st.plotly_chart(
+        plot_return_histogram(
+            strategy_returns.to_frame(name="ret").assign(fund_code="Strateji")
+        ),
+        use_container_width=True,
     )
 
-if debug_mode:
-    st.subheader("Debug (raw data)")
-    st.write("Raw prices (head)")
-    st.dataframe(prices.head(200), use_container_width=True)
-    st.write("Selected prices (head)")
-    st.dataframe(selected_prices.head(200), use_container_width=True)
-    st.write("Fund-level returns (head)")
-    st.dataframe(returns_long.head(200), use_container_width=True)
-    st.write(
-        f"Returns pivot shape: {returns_wide.shape}, date min: {returns_wide.index.min()}, date max: {returns_wide.index.max()}"
+with tab_monte:
+    st.subheader(f"Şans Testi: {actual_k} Fonu Rastgele Seçseydik?")
+    st.markdown(
+        "Bu simülasyon, başarınızın 'strateji' mi yoksa sadece 'piyasanın yükselmesi' mi olduğunu test eder."
     )
+
+    if st.button("Simülasyonu Başlat (1000 Tekrar)"):
+        with st.spinner("Monte Carlo çalışıyor..."):
+            # Hızlı simülasyon için Buy & Hold getirileri
+            first_prices = prices_wide.iloc[0]
+            last_prices = prices_wide.iloc[-1]
+            fund_total_returns = (last_prices / first_prices) - 1.0
+            fund_total_returns = fund_total_returns.fillna(0.0)
+
+            valid_rets = fund_total_returns.values
+            n_sims = 1000
+            mc_results = []
+            rng = np.random.default_rng()
+
+            # Progress bar
+            bar = st.progress(0)
+            for i in range(n_sims):
+                chosen = rng.choice(valid_rets, size=actual_k, replace=False)
+                # Eşit ağırlıklı portföy getirisi = ortalama getiri
+                mc_results.append(np.mean(chosen))
+                if i % 100 == 0:
+                    bar.progress((i + 1) / n_sims)
+            bar.progress(1.0)
+
+            mc_series = pd.Series(mc_results)
+
+            # Görselleştirme
+            fig = px.histogram(
+                mc_series,
+                nbins=50,
+                title="Rastgele Portföylerin Getiri Dağılımı",
+                labels={"value": "Getiri"},
+            )
+            fig.add_vline(
+                x=total_ret_pct,
+                line_dash="dash",
+                line_color="red",
+                annotation_text="Sizin Stratejiniz",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Yorum
+            better_than_random = (total_ret_pct > mc_series).mean() * 100
+            st.success(
+                f"Sizin stratejiniz, rastgele oluşturulan portföylerin **%{better_than_random:.1f}** tanesinden daha iyi performans gösterdi."
+            )
+
+with tab_metrics:
+    st.subheader("Detaylı Metrikler")
+    # Rolling Metrics
+    rolling_df = rolling_metrics(strategy_returns, window=30)
+    st.plotly_chart(plot_rolling_metrics(rolling_df, None), use_container_width=True)
+
+    # Drawdown
+    dd_series = drawdown_series(strategy_equity)
+    st.plotly_chart(plot_drawdown(dd_series), use_container_width=True)
+
+    # Fon Özeti Tablosu
+    st.dataframe(filtered_summary)

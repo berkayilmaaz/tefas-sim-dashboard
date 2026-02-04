@@ -27,6 +27,8 @@ class StrategyParams:
         "momentum_top_k",
         "low_vol_top_k",
         "sharpe_top_k",
+        "risk_parity",
+        "min_variance",
     ] = "equal_weight"
     lookback: int = 20
     rebalance: Literal["daily", "weekly", "monthly"] = "monthly"

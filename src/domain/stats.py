@@ -1,6 +1,6 @@
 # src/domain/stats.py
 from __future__ import annotations
-
+from scipy.stats import shapiro, skew, kurtosis
 import numpy as np
 import pandas as pd
 
@@ -39,3 +39,78 @@ def sharpe(daily_ret: pd.Series, rf: float = 0.0, trading_days: int = 252) -> fl
     if denom == 0 or np.isnan(denom):
         return float("nan")
     return float((excess.mean() / denom) * np.sqrt(trading_days))
+
+
+def rolling_volatility(
+    daily_ret: pd.Series, window: int, trading_days: int = 252
+) -> pd.Series:
+    rolling_std = daily_ret.rolling(window=window, min_periods=window).std(ddof=1)
+    return rolling_std * np.sqrt(trading_days)
+
+
+def rolling_sharpe(
+    daily_ret: pd.Series, window: int, trading_days: int = 252
+) -> pd.Series:
+    rolling_mean = daily_ret.rolling(window=window, min_periods=window).mean()
+    rolling_std = daily_ret.rolling(window=window, min_periods=window).std(ddof=1)
+    sharpe_series = rolling_mean / rolling_std.replace(0.0, np.nan)
+    return sharpe_series * np.sqrt(trading_days)
+
+
+def rolling_max_drawdown(daily_ret: pd.Series, window: int) -> pd.Series:
+    def _window_mdd(values: np.ndarray) -> float:
+        equity = np.cumprod(1.0 + values)
+        peak = np.maximum.accumulate(equity)
+        dd = equity / peak - 1.0
+        return float(np.min(dd))
+
+    return daily_ret.rolling(window=window, min_periods=window).apply(
+        _window_mdd, raw=True
+    )
+
+
+def rolling_metrics(
+    daily_ret: pd.Series, window: int, trading_days: int = 252
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "rolling_vol": rolling_volatility(daily_ret, window, trading_days),
+            "rolling_sharpe": rolling_sharpe(daily_ret, window, trading_days),
+            "rolling_max_drawdown": rolling_max_drawdown(daily_ret, window),
+        }
+    )
+
+
+def check_normality(daily_ret: pd.Series) -> dict:
+    """
+    Getiri serisinin Normal Dağılıma uyup uymadığını test eder.
+    Testler: Shapiro-Wilk, Skewness, Kurtosis.
+    """
+    data = daily_ret.dropna()
+
+    # Veri çok azsa (örn: 3 günden az) test çalışmaz/anlamsızdır.
+    if len(data) < 3:
+        return {
+            "is_normal": False,
+            "p_value": 0.0,
+            "statistic": 0.0,
+            "skew": 0.0,
+            "kurtosis": 0.0,
+        }
+
+    # Shapiro-Wilk Testi
+    # H0 (Null Hypothesis): Veri normal dağılımdan gelmektedir.
+    # p-value < 0.05 ise H0 reddedilir -> Normal DEĞİL.
+    stat, p_value = shapiro(data)
+
+    # Momentler
+    s = skew(data)  # 0'dan sapma asimetriyi gösterir
+    k = kurtosis(data)  # Fisher definition (Normal = 0 kabul edilir)
+
+    return {
+        "is_normal": p_value > 0.05,
+        "p_value": p_value,
+        "statistic": stat,
+        "skew": s,
+        "kurtosis": k,
+    }
