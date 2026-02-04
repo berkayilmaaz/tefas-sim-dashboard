@@ -1,6 +1,6 @@
 # src/domain/stats.py
 from __future__ import annotations
-
+from scipy.stats import shapiro, skew, kurtosis
 import numpy as np
 import pandas as pd
 
@@ -79,3 +79,38 @@ def rolling_metrics(
             "rolling_max_drawdown": rolling_max_drawdown(daily_ret, window),
         }
     )
+
+
+def check_normality(daily_ret: pd.Series) -> dict:
+    """
+    Getiri serisinin Normal Dağılıma uyup uymadığını test eder.
+    Testler: Shapiro-Wilk, Skewness, Kurtosis.
+    """
+    data = daily_ret.dropna()
+
+    # Veri çok azsa (örn: 3 günden az) test çalışmaz/anlamsızdır.
+    if len(data) < 3:
+        return {
+            "is_normal": False,
+            "p_value": 0.0,
+            "statistic": 0.0,
+            "skew": 0.0,
+            "kurtosis": 0.0,
+        }
+
+    # Shapiro-Wilk Testi
+    # H0 (Null Hypothesis): Veri normal dağılımdan gelmektedir.
+    # p-value < 0.05 ise H0 reddedilir -> Normal DEĞİL.
+    stat, p_value = shapiro(data)
+
+    # Momentler
+    s = skew(data)  # 0'dan sapma asimetriyi gösterir
+    k = kurtosis(data)  # Fisher definition (Normal = 0 kabul edilir)
+
+    return {
+        "is_normal": p_value > 0.05,
+        "p_value": p_value,
+        "statistic": stat,
+        "skew": s,
+        "kurtosis": k,
+    }

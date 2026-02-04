@@ -130,9 +130,7 @@ def build_weights(
     if not weights_by_date:
         return pd.DataFrame(), pd.DataFrame()
 
-    weights_daily = pd.DataFrame(
-        index=dates, columns=returns_wide.columns, dtype=float
-    )
+    weights_daily = pd.DataFrame(index=dates, columns=returns_wide.columns, dtype=float)
     rows = []
     for date, weights in weights_by_date.items():
         weights_daily.loc[date, weights.index] = weights.values
@@ -157,9 +155,7 @@ def compute_portfolio_returns(
     if weights_daily.empty:
         return pd.Series(dtype=float, name="portfolio_ret")
     aligned_returns = returns_wide.loc[weights_daily.index]
-    port_ret = (aligned_returns.fillna(0.0) * weights_daily.fillna(0.0)).sum(
-        axis=1
-    )
+    port_ret = (aligned_returns.fillna(0.0) * weights_daily.fillna(0.0)).sum(axis=1)
     port_ret = port_ret.dropna()
     port_ret.name = "portfolio_ret"
     return port_ret
@@ -177,3 +173,88 @@ def equal_weight_portfolio(
     ).sort_index()
     weights_daily, _ = build_weights(returns_wide, params)
     return compute_portfolio_returns(returns_wide, weights_daily)
+
+
+def backtest_portfolio_assets(
+    prices: pd.DataFrame, weights_table: pd.DataFrame, initial_capital: float
+) -> pd.DataFrame:
+    """
+    Gerçekçi Backtest Motoru (Asset/Share Based):
+    - Belirli tarihlerde (rebalance) portföyü hedef ağırlıklara göre yeniden kurar.
+    - Ara günlerde 'shares * price' mantığıyla değer taşır (Weight Drift'e izin verir).
+
+    Args:
+        prices: [index=date, columns=fund_code] (Wide format fiyatlar)
+        weights_table: [rebalance_date, fund_code, weight]
+        initial_capital: Başlangıç sermayesi (örn: 100.000 TL)
+
+    Returns:
+        pd.DataFrame: [equity, ret] index=date
+    """
+    if weights_table.empty or prices.empty:
+        return pd.DataFrame()
+
+    # Rebalance tarihlerini sırala
+    rebalance_dates = sorted(weights_table["rebalance_date"].unique())
+
+    # Analizi ilk rebalance gününden başlat (Örn: İlk işlem günü)
+    start_date = rebalance_dates[0]
+    prices = prices.loc[start_date:].copy()
+    dates = prices.index
+
+    # Hazırlık: Hedef ağırlıkları pivot tabloya çevir
+    target_weights_df = weights_table.pivot(
+        index="rebalance_date", columns="fund_code", values="weight"
+    ).fillna(0.0)
+
+    # Simülasyon değişkenleri
+    current_cash = initial_capital
+    current_shares = pd.Series(0.0, index=prices.columns)
+
+    # Günlük portföy değerlerini saklayacak sözlük
+    p_values = {}
+
+    # Rebalance günlerini hızlı kontrol için set'e çevir
+    reb_set = set(rebalance_dates)
+
+    for d in dates:
+        # 1. O günkü fiyatlar
+        # (Fiyatı olmayan fonlar NaN gelebilir, fillna(0) ile değerini 0 sayıyoruz)
+        p = prices.loc[d].fillna(0.0)
+
+        # 2. Rebalance Öncesi Portföy Değeri Hesapla
+        # Mevcut hisseler * Bugünkü fiyat + Nakit
+        val_assets = (current_shares * p).sum()
+        total_value = current_cash + val_assets
+
+        # 3. Eğer bugün rebalance günü ise portföyü yeniden dağıt
+        if d in reb_set:
+            # O gün için hedeflenen ağırlıklar
+            w = target_weights_df.loc[d]
+
+            # Elimizdeki toplam parayı (Hisse + Nakit) ağırlıklara göre bölüştür
+            # (İşlem maliyeti 0 varsayıyoruz)
+            target_amounts = total_value * w
+
+            # Yeni hisse adetleri = Hedef Tutar / Fiyat
+            # Fiyatı 0 olan fona bölersek sonsuz çıkar, onu 0 yapalım
+            new_shares = target_amounts / p
+            new_shares = new_shares.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+            current_shares = new_shares
+            current_cash = 0.0  # Full invest varsayımı (küsüratlar ihmal)
+
+            # Rebalance sonrası değeri teyit et (Kontrol amaçlı)
+            val_assets = (current_shares * p).sum()
+            total_value = current_cash + val_assets
+
+        p_values[d] = total_value
+
+    # Sonuç serisi: Equity Curve (TL cinsinden)
+    result = pd.Series(p_values, name="equity")
+
+    # Günlük Getiri hesapla (Analizler için gerekli: % değişim)
+    df_res = pd.DataFrame(result)
+    df_res["ret"] = df_res["equity"].pct_change().fillna(0.0)
+
+    return df_res
