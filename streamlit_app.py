@@ -35,6 +35,7 @@ st.set_page_config(page_title="TEFAS Simülasyonu", layout="wide")
 
 metadata = loader.get_metadata()
 
+
 # -----------------------------------------------------------------------------
 # DATA LOADERS
 # -----------------------------------------------------------------------------
@@ -117,25 +118,30 @@ master_data["date"] = pd.to_datetime(master_data["date"], errors="coerce")
 min_date = master_data["date"].min().date()
 max_date = master_data["date"].max().date()
 
+d  # ... önceki kodlar ...
+
 date_range = st.sidebar.date_input(
     "Tarih Aralığı",
     value=(min_date, max_date),
     min_value=min_date,
     max_value=max_date,
 )
-if isinstance(date_range, tuple):
+
+# GÜVENLİ TARİH ÇÖZÜMLEME (YENİ KOD)
+if isinstance(date_range, tuple) and len(date_range) == 2:
     start_date_input, end_date_input = date_range
+elif isinstance(date_range, (list, tuple)) and len(date_range) == 1:
+    # Kullanıcı sadece başlangıç tarihini seçtiyse veya tek tarih döndüyse
+    start_date_input = date_range[0]
+    end_date_input = date_range[0]
 else:
-    start_date_input = date_range
-    end_date_input = date_range
+    # Hata durumunda varsayılan değerleri kullan
+    start_date_input = min_date
+    end_date_input = max_date
+
 
 fund_type_options = (
-    master_data["category"]
-    .dropna()
-    .astype(str)
-    .sort_values()
-    .unique()
-    .tolist()
+    master_data["category"].dropna().astype(str).sort_values().unique().tolist()
 )
 selected_fund_types = st.sidebar.multiselect(
     "Fon Türü",
@@ -143,12 +149,7 @@ selected_fund_types = st.sidebar.multiselect(
 )
 
 fund_code_options = (
-    master_data["fund_code"]
-    .dropna()
-    .astype(str)
-    .sort_values()
-    .unique()
-    .tolist()
+    master_data["fund_code"].dropna().astype(str).sort_values().unique().tolist()
 )
 selected_fund_codes = st.sidebar.multiselect(
     "Fon Kodu",
@@ -477,13 +478,9 @@ with tab_metrics:
             cpi_norm.rename("equity").to_frame().assign(fund_code="TÜFE")
         )
         comparison_df = (
-            pd.concat(comparison_frames)
-            .reset_index()
-            .rename(columns={"index": "date"})
+            pd.concat(comparison_frames).reset_index().rename(columns={"index": "date"})
         )
-        st.plotly_chart(
-            plot_equity_comparison(comparison_df), use_container_width=True
-        )
+        st.plotly_chart(plot_equity_comparison(comparison_df), use_container_width=True)
 
     # Fon Özeti Tablosu
     st.dataframe(filtered_summary)
