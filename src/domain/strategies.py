@@ -25,6 +25,9 @@ class MonteCarloResult:
     median_random: float
     p5_random: float
     p95_random: float
+    n_valid_funds: int = 0
+    draw_k: int = 0
+    is_degenerate: bool = False  # True when draw_k >= n_funds
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +281,7 @@ def backtest_portfolio_assets(
 
 
 # ---------------------------------------------------------------------------
-# Monte Carlo simulation — FIXED argpartition bug
+# Monte Carlo simulation — FIXED argpartition bug + degenerate case handling
 # ---------------------------------------------------------------------------
 def run_monte_carlo_simulation(
     prices_wide: pd.DataFrame,
@@ -286,15 +289,16 @@ def run_monte_carlo_simulation(
     strategy_total_return: float,
     n_sims: int = 1_000,
     seed: int | None = None,
+    full_pool_size: int | None = None,
 ) -> MonteCarloResult:
     """
-    Vectorised Monte Carlo: randomly pick *actual_k* funds, compute
-    equal-weight buy-and-hold total return, repeat *n_sims* times.
+    Vectorised Monte Carlo: randomly pick *actual_k* funds from the
+    FULL filtered pool, compute equal-weight buy-and-hold total return,
+    repeat *n_sims* times.
 
-    BUG FIX: np.argpartition(arr, kth=N) requires kth < N.
-    When draw_k >= n_funds (e.g. picking 50 out of 50), every sim
-    picks ALL funds → deterministic result. We handle this as a
-    special case to avoid the ValueError.
+    When actual_k >= n_valid_funds, every sim picks ALL funds → the
+    result is deterministic. We flag this via is_degenerate=True so
+    the UI can show an appropriate message.
     """
     empty_result = MonteCarloResult(
         simulated_returns=np.array([]),
@@ -327,13 +331,9 @@ def run_monte_carlo_simulation(
     n_funds = len(valid_returns)
     draw_k = min(actual_k, n_funds)
 
-    # ------------------------------------------------------------------
-    # CRITICAL FIX: Handle draw_k >= n_funds edge case.
-    # argpartition(arr, kth) requires kth to be STRICTLY LESS than
-    # the array size. When draw_k == n_funds, every simulation
-    # simply picks all funds — result is the same for all sims.
-    # ------------------------------------------------------------------
-    if draw_k >= n_funds:
+    # CRITICAL: Handle draw_k >= n_funds (degenerate case)
+    is_degenerate = draw_k >= n_funds
+    if is_degenerate:
         mean_return = float(valid_returns.mean())
         sim_portfolio_returns = np.full(n_sims, mean_return)
     else:
@@ -343,7 +343,7 @@ def run_monte_carlo_simulation(
         sampled_returns = valid_returns[idx_matrix]
         sim_portfolio_returns = sampled_returns.mean(axis=1)
 
-    # 3. Statistics
+    # Statistics
     percentile_rank = float(
         (strategy_total_return > sim_portfolio_returns).mean() * 100
     )
@@ -358,4 +358,7 @@ def run_monte_carlo_simulation(
         median_random=median_random,
         p5_random=p5_random,
         p95_random=p95_random,
+        n_valid_funds=n_funds,
+        draw_k=draw_k,
+        is_degenerate=is_degenerate,
     )
