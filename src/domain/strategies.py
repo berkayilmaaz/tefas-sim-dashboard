@@ -19,9 +19,9 @@ logger = logging.getLogger(__name__)
 class MonteCarloResult:
     """Container for Monte Carlo simulation outputs."""
 
-    simulated_returns: np.ndarray  # (n_sims,) array of portfolio total returns
-    strategy_return: float  # the actual strategy return for comparison
-    percentile_rank: float  # % of random portfolios beaten (0-100)
+    simulated_returns: np.ndarray
+    strategy_return: float
+    percentile_rank: float
     median_random: float
     p5_random: float
     p95_random: float
@@ -88,7 +88,7 @@ def _min_variance_weights(window: pd.DataFrame) -> pd.Series:
     try:
         inv_cov = np.linalg.pinv(cov.values)
     except np.linalg.LinAlgError:
-        logger.warning("Covariance matrix inversion failed, returning empty weights")
+        logger.warning("Covariance matrix inversion failed")
         return pd.Series(dtype=float)
     ones = np.ones(inv_cov.shape[0])
     raw = inv_cov @ ones
@@ -201,10 +201,6 @@ def compute_portfolio_returns(
 def equal_weight_portfolio(
     returns_long: pd.DataFrame, params: StrategyParams
 ) -> pd.Series:
-    """
-    returns_long: [date, fund_code, ret]
-    Output: portfolio daily return series indexed by date
-    """
     if returns_long.empty:
         return pd.Series(dtype=float, name="portfolio_ret")
     returns_wide = returns_long.pivot_table(
@@ -220,22 +216,6 @@ def equal_weight_portfolio(
 def backtest_portfolio_assets(
     prices: pd.DataFrame, weights_table: pd.DataFrame, initial_capital: float
 ) -> pd.DataFrame:
-    """
-    Realistic backtest engine (Asset/Share based).
-
-    Between rebalance dates the portfolio value drifts with prices
-    (shares * current_price).  On rebalance dates the portfolio is
-    re-allocated to target weights at zero transaction cost.
-
-    Args:
-        prices: Wide-format prices [index=date, columns=fund_code].
-        weights_table: [rebalance_date, fund_code, weight].
-        initial_capital: Starting capital in TL.
-
-    Returns:
-        pd.DataFrame with columns [equity, ret], indexed by date.
-        Returns empty DataFrame on invalid inputs.
-    """
     if weights_table.empty or prices.empty:
         return pd.DataFrame()
 
@@ -243,10 +223,7 @@ def backtest_portfolio_assets(
         logger.warning("initial_capital must be > 0, got %s", initial_capital)
         return pd.DataFrame()
 
-    # Sort rebalance dates
     rebalance_dates = sorted(weights_table["rebalance_date"].unique())
-
-    # Start from first rebalance date
     start_date = rebalance_dates[0]
     prices = prices.loc[start_date:].copy()
     if prices.empty:
@@ -254,17 +231,14 @@ def backtest_portfolio_assets(
 
     dates = prices.index
 
-    # Pivot target weights
     target_weights_df = weights_table.pivot(
         index="rebalance_date", columns="fund_code", values="weight"
     ).fillna(0.0)
 
-    # Ensure all price columns exist in weights (fill missing with 0)
     for col in prices.columns:
         if col not in target_weights_df.columns:
             target_weights_df[col] = 0.0
 
-    # Simulation state
     current_cash = initial_capital
     current_shares = pd.Series(0.0, index=prices.columns)
     p_values = {}
@@ -272,29 +246,23 @@ def backtest_portfolio_assets(
 
     for d in dates:
         p = prices.loc[d].fillna(0.0)
-
-        # Portfolio value BEFORE any rebalance
         val_assets = (current_shares * p).sum()
         total_value = current_cash + val_assets
 
-        # Guard against degenerate values
         if np.isnan(total_value) or total_value < 0:
             total_value = 0.0
 
-        # Rebalance if scheduled
         if d in reb_set and d in target_weights_df.index:
             w = target_weights_df.loc[d].reindex(prices.columns, fill_value=0.0)
             target_amounts = total_value * w
 
-            # shares = amount / price; guard against division by zero
             with np.errstate(divide="ignore", invalid="ignore"):
                 new_shares = target_amounts / p
             new_shares = new_shares.replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
             current_shares = new_shares
-            current_cash = 0.0  # fully invested assumption
+            current_cash = 0.0
 
-            # Recalculate after rebalance (sanity)
             val_assets = (current_shares * p).sum()
             total_value = current_cash + val_assets
 
@@ -310,7 +278,7 @@ def backtest_portfolio_assets(
 
 
 # ---------------------------------------------------------------------------
-# Monte Carlo simulation  (NEW)
+# Monte Carlo simulation — FIXED argpartition bug
 # ---------------------------------------------------------------------------
 def run_monte_carlo_simulation(
     prices_wide: pd.DataFrame,
@@ -323,34 +291,24 @@ def run_monte_carlo_simulation(
     Vectorised Monte Carlo: randomly pick *actual_k* funds, compute
     equal-weight buy-and-hold total return, repeat *n_sims* times.
 
-    Handles NaNs gracefully (funds that start on different dates):
-    - Per-fund total return is computed only over the fund's own valid
-      price range (first non-NaN to last non-NaN).
-    - Funds with < 2 valid price observations are excluded.
-
-    Args:
-        prices_wide: Wide prices [index=date, columns=fund_code].
-        actual_k:    Number of funds to pick per random portfolio.
-        strategy_total_return: The real strategy's total return (for ranking).
-        n_sims:      Number of Monte Carlo iterations.
-        seed:        Optional RNG seed for reproducibility.
-
-    Returns:
-        MonteCarloResult dataclass.
+    BUG FIX: np.argpartition(arr, kth=N) requires kth < N.
+    When draw_k >= n_funds (e.g. picking 50 out of 50), every sim
+    picks ALL funds → deterministic result. We handle this as a
+    special case to avoid the ValueError.
     """
-    if prices_wide.empty or actual_k < 1:
-        return MonteCarloResult(
-            simulated_returns=np.array([]),
-            strategy_return=strategy_total_return,
-            percentile_rank=np.nan,
-            median_random=np.nan,
-            p5_random=np.nan,
-            p95_random=np.nan,
-        )
+    empty_result = MonteCarloResult(
+        simulated_returns=np.array([]),
+        strategy_return=strategy_total_return,
+        percentile_rank=np.nan,
+        median_random=np.nan,
+        p5_random=np.nan,
+        p95_random=np.nan,
+    )
 
-    # ------------------------------------------------------------------
-    # 1. Compute per-fund total return (handles NaN start dates)
-    # ------------------------------------------------------------------
+    if prices_wide.empty or actual_k < 1:
+        return empty_result
+
+    # 1. Compute per-fund total return (NaN-safe)
     fund_returns = {}
     for fund in prices_wide.columns:
         series = prices_wide[fund].dropna()
@@ -363,38 +321,29 @@ def run_monte_carlo_simulation(
         fund_returns[fund] = (last_price / first_price) - 1.0
 
     if not fund_returns:
-        return MonteCarloResult(
-            simulated_returns=np.array([]),
-            strategy_return=strategy_total_return,
-            percentile_rank=np.nan,
-            median_random=np.nan,
-            p5_random=np.nan,
-            p95_random=np.nan,
-        )
+        return empty_result
 
     valid_returns = np.array(list(fund_returns.values()), dtype=np.float64)
     n_funds = len(valid_returns)
     draw_k = min(actual_k, n_funds)
 
     # ------------------------------------------------------------------
-    # 2. Vectorised random sampling
+    # CRITICAL FIX: Handle draw_k >= n_funds edge case.
+    # argpartition(arr, kth) requires kth to be STRICTLY LESS than
+    # the array size. When draw_k == n_funds, every simulation
+    # simply picks all funds — result is the same for all sims.
     # ------------------------------------------------------------------
-    rng = np.random.default_rng(seed)
+    if draw_k >= n_funds:
+        mean_return = float(valid_returns.mean())
+        sim_portfolio_returns = np.full(n_sims, mean_return)
+    else:
+        rng = np.random.default_rng(seed)
+        rand_matrix = rng.random((n_sims, n_funds))
+        idx_matrix = np.argpartition(rand_matrix, draw_k, axis=1)[:, :draw_k]
+        sampled_returns = valid_returns[idx_matrix]
+        sim_portfolio_returns = sampled_returns.mean(axis=1)
 
-    # Build (n_sims, draw_k) index matrix via argsort trick on uniform randoms
-    # This is much faster than a Python loop.
-    rand_matrix = rng.random((n_sims, n_funds))
-    # For each row, the first `draw_k` indices of argsort give a random
-    # sample without replacement.
-    idx_matrix = np.argpartition(rand_matrix, draw_k, axis=1)[:, :draw_k]
-
-    # Gather returns and compute equal-weight portfolio return per sim
-    sampled_returns = valid_returns[idx_matrix]  # (n_sims, draw_k)
-    sim_portfolio_returns = sampled_returns.mean(axis=1)  # (n_sims,)
-
-    # ------------------------------------------------------------------
     # 3. Statistics
-    # ------------------------------------------------------------------
     percentile_rank = float(
         (strategy_total_return > sim_portfolio_returns).mean() * 100
     )

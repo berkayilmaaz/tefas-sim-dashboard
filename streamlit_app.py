@@ -2,6 +2,7 @@
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 from src.data import loader
@@ -16,6 +17,11 @@ from src.domain.stats import (
     sharpe,
     total_return,
     check_normality,
+    hurst_exponent,
+    shannon_entropy,
+    mean_reversion_halflife,
+    variance_ratio_test,
+    compute_fund_analytics,
 )
 from src.domain.strategies import (
     build_weights,
@@ -33,14 +39,18 @@ from src.viz.plots import (
     plot_rolling_metrics,
 )
 
-st.set_page_config(page_title="TEFAS Simülasyonu", layout="wide")
+st.set_page_config(
+    page_title="TEFAS Simülasyon Laboratuvarı",
+    page_icon="🔬",
+    layout="wide",
+)
 
 metadata = loader.get_metadata()
 
 
-# -----------------------------------------------------------------------------
-# DATA LOADERS
-# -----------------------------------------------------------------------------
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
 @st.cache_data(show_spinner=False)
 def summarize_funds(prices: pd.DataFrame) -> pd.DataFrame:
     if prices.empty:
@@ -106,18 +116,24 @@ def select_funds(
     return fund_codes, missing_manual
 
 
-# -----------------------------------------------------------------------------
+def format_pct(val: float) -> str:
+    if pd.isna(val):
+        return "—"
+    return f"%{val * 100:.2f}"
+
+
+# =============================================================================
 # SIDEBAR
-# -----------------------------------------------------------------------------
-st.sidebar.header("Girdiler")
+# =============================================================================
+st.sidebar.header("⚙️ Girdiler")
 
 last_updated = metadata.get("last_updated", "Bilinmiyor")
-st.sidebar.caption(f"Veriler en son {last_updated} tarihinde güncellendi.")
+st.sidebar.caption(f"📅 Son güncelleme: {last_updated}")
 
 if not loader.MASTER_PATH.exists():
     st.error(
-        "Veri dosyası bulunamadı. Lütfen `python -m scripts.update_data` "
-        "komutunu çalıştırın."
+        "Veri dosyası bulunamadı. "
+        "`python -m scripts.update_data` komutunu çalıştırın."
     )
     st.stop()
 
@@ -141,8 +157,6 @@ if master_data.empty:
 min_date = master_data["date"].min().date()
 max_date = master_data["date"].max().date()
 
-# FIX: Removed stray `d` character that was here (syntax error)
-
 date_range = st.sidebar.date_input(
     "Tarih Aralığı",
     value=(min_date, max_date),
@@ -150,7 +164,6 @@ date_range = st.sidebar.date_input(
     max_value=max_date,
 )
 
-# Safe date range unpacking
 if isinstance(date_range, tuple) and len(date_range) == 2:
     start_date_input, end_date_input = date_range
 elif isinstance(date_range, (list, tuple)) and len(date_range) == 1:
@@ -159,7 +172,6 @@ elif isinstance(date_range, (list, tuple)) and len(date_range) == 1:
 else:
     start_date_input = min_date
     end_date_input = max_date
-
 
 fund_type_options = (
     master_data["category"].dropna().astype(str).sort_values().unique().tolist()
@@ -171,12 +183,12 @@ fund_code_options = (
 )
 selected_fund_codes = st.sidebar.multiselect("Fon Kodu", options=fund_code_options)
 
-st.sidebar.subheader("Sermaye Yönetimi")
+st.sidebar.subheader("💰 Sermaye Yönetimi")
 per_fund_capital = st.sidebar.number_input(
     "Fon Başına Başlangıç (TL)", value=1000.0, step=100.0
 )
 
-st.sidebar.subheader("Fon Filtresi")
+st.sidebar.subheader("🔍 Fon Filtresi")
 min_aum = st.sidebar.number_input(
     "Minimum AUM (son gün)", min_value=0.0, value=0.0, step=1_000_000.0
 )
@@ -187,8 +199,8 @@ missing_tolerance = st.sidebar.number_input(
     "Eksik gün toleransı", min_value=0, value=5, step=1
 )
 
-st.sidebar.subheader("Strateji Seçimi")
-k = st.sidebar.slider("K (Fon Sayısı)", min_value=10, max_value=500, value=50)
+st.sidebar.subheader("🎯 Strateji Seçimi")
+k = st.sidebar.slider("K (Fon Sayısı)", min_value=2, max_value=500, value=50)
 
 selection_mode = st.sidebar.radio(
     "Havuz Seçimi",
@@ -233,14 +245,14 @@ rebalance = st.sidebar.selectbox(
     "Rebalance Sıklığı", ["daily", "weekly", "monthly"], index=2
 )
 
-if st.sidebar.button("Önbelleği temizle"):
+if st.sidebar.button("🗑️ Önbelleği temizle"):
     st.cache_data.clear()
     st.sidebar.success("Temizlendi.")
 
-# -----------------------------------------------------------------------------
-# MAIN LOGIC
-# -----------------------------------------------------------------------------
-st.title("TEFAS Simülasyon & İstatistik Laboratuvarı")
+# =============================================================================
+# MAIN LOGIC — DATA LOADING & BACKTEST
+# =============================================================================
+st.title("🔬 TEFAS Simülasyon & İstatistik Laboratuvarı")
 
 start_date = pd.Timestamp(start_date_input)
 end_date = pd.Timestamp(end_date_input)
@@ -306,12 +318,6 @@ if not selected_funds:
 actual_k = len(selected_funds)
 initial_capital = actual_k * per_fund_capital
 
-st.info(
-    f"**Simülasyon Ayarları:** {actual_k} fon seçildi. "
-    f"Fon başı {per_fund_capital:,.0f} TL. "
-    f"Toplam Sermaye: **{initial_capital:,.0f} TL**"
-)
-
 # 3. BACKTEST
 selected_prices = prices[prices["fund_code"].isin(selected_funds)]
 returns_long = compute_fund_daily_returns(selected_prices)
@@ -349,54 +355,321 @@ if df_results.empty:
 strategy_equity = df_results["equity"]
 strategy_returns = df_results["ret"]
 
-# 4. RESULTS
+# 4. TOP KPIs
 final_value = strategy_equity.iloc[-1]
 net_profit = final_value - initial_capital
 total_ret_pct = net_profit / initial_capital if initial_capital > 0 else 0.0
 
-col1, col2, col3 = st.columns(3)
-col1.metric("Başlangıç Sermayesi", f"{initial_capital:,.0f} TL")
-col2.metric(
-    "Bitiş Sermayesi",
-    f"{final_value:,.0f} TL",
-    f"%{total_ret_pct * 100:.2f}",
+st.info(
+    f"**{actual_k}** fon seçildi · Fon başı **{per_fund_capital:,.0f} TL** · "
+    f"Toplam Sermaye: **{initial_capital:,.0f} TL** · "
+    f"Strateji: **{strategy_label}** · Rebalance: **{rebalance}**"
 )
+
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Başlangıç", f"{initial_capital:,.0f} TL")
+col2.metric("Bitiş", f"{final_value:,.0f} TL", f"%{total_ret_pct * 100:.2f}")
 col3.metric("Net Kâr/Zarar", f"{net_profit:,.0f} TL")
+col4.metric("Max Drawdown", format_pct(max_drawdown(strategy_equity)))
 
-# EQUITY CHART
+# EQUITY CHART (always visible)
 st.subheader("Portföy Değeri (TL)")
-st.plotly_chart(
-    plot_equity(strategy_equity / initial_capital), use_container_width=True
+eq_fig = go.Figure()
+eq_fig.add_trace(
+    go.Scatter(
+        x=strategy_equity.index,
+        y=strategy_equity.values,
+        mode="lines",
+        name="Portföy",
+        line=dict(width=2),
+    )
 )
+eq_fig.update_layout(
+    yaxis_title="TL",
+    xaxis_title="Tarih",
+    margin=dict(l=10, r=10, t=30, b=10),
+    height=350,
+)
+st.plotly_chart(eq_fig, use_container_width=True)
 
+
+# =============================================================================
 # TABS
-tab_stats, tab_monte, tab_metrics = st.tabs(
-    ["📊 İstatistiksel Analiz", "🎲 Monte Carlo Simülasyonu", "📈 Metrikler & Tablo"]
+# =============================================================================
+(
+    tab_funds,
+    tab_compare,
+    tab_stats,
+    tab_monte,
+    tab_physics,
+    tab_metrics,
+) = st.tabs(
+    [
+        "📋 Seçilen Fonlar",
+        "⚔️ Fon Karşılaştırma",
+        "📊 İstatistiksel Analiz",
+        "🎲 Monte Carlo",
+        "⚛️ Fizik Metrikleri",
+        "📈 Metrikler & Tablo",
+    ]
 )
 
-# ---- TAB 1: Statistical Analysis ----------------------------------------
+
+# ── TAB 1: FUND EXPLORER ─────────────────────────────────────────────────────
+with tab_funds:
+    st.subheader(f"Portföydeki {actual_k} Fon")
+
+    fund_analytics = compute_fund_analytics(returns_long, prices_wide)
+
+    if fund_analytics.empty:
+        st.warning("Fon analitikleri hesaplanamadı.")
+    else:
+        # Merge with fund names
+        name_map = (
+            selected_prices[["fund_code", "fund_name"]]
+            .drop_duplicates("fund_code")
+            .set_index("fund_code")["fund_name"]
+        )
+        fund_analytics["fund_name"] = fund_analytics["fund_code"].map(name_map)
+
+        sort_col = st.selectbox(
+            "Sıralama Kriteri",
+            options=[
+                "total_return",
+                "annualized_vol",
+                "sharpe",
+                "max_drawdown",
+                "best_day",
+                "worst_day",
+                "hurst",
+            ],
+            format_func=lambda x: {
+                "total_return": "Toplam Getiri",
+                "annualized_vol": "Yıllık Volatilite",
+                "sharpe": "Sharpe Oranı",
+                "max_drawdown": "Max Drawdown",
+                "best_day": "En İyi Gün",
+                "worst_day": "En Kötü Gün",
+                "hurst": "Hurst Üsteli",
+            }.get(x, x),
+        )
+
+        sort_asc = sort_col in ["max_drawdown", "annualized_vol", "worst_day"]
+        display_df = fund_analytics.sort_values(sort_col, ascending=sort_asc).copy()
+
+        # Format for display
+        display_df_show = display_df[
+            [
+                "fund_code",
+                "fund_name",
+                "total_return",
+                "annualized_vol",
+                "sharpe",
+                "max_drawdown",
+                "best_day",
+                "worst_day",
+                "est_monthly_ret",
+                "hurst",
+                "obs_days",
+            ]
+        ].copy()
+        display_df_show.columns = [
+            "Fon Kodu",
+            "Fon Adı",
+            "Toplam Getiri",
+            "Yıllık Vol",
+            "Sharpe",
+            "MDD",
+            "En İyi Gün",
+            "En Kötü Gün",
+            "Tahmini Aylık",
+            "Hurst",
+            "Gözlem",
+        ]
+
+        st.dataframe(
+            display_df_show.style.format(
+                {
+                    "Toplam Getiri": "{:.2%}",
+                    "Yıllık Vol": "{:.2%}",
+                    "Sharpe": "{:.2f}",
+                    "MDD": "{:.2%}",
+                    "En İyi Gün": "{:.2%}",
+                    "En Kötü Gün": "{:.2%}",
+                    "Tahmini Aylık": "{:.2%}",
+                    "Hurst": "{:.3f}",
+                }
+            ),
+            use_container_width=True,
+            height=min(35 * actual_k + 38, 600),
+        )
+
+        # Quick visual: Risk-Return scatter
+        st.subheader("Risk-Getiri Haritası")
+        scatter_df = fund_analytics.dropna(subset=["annualized_vol", "total_return"])
+        if not scatter_df.empty:
+            scatter_df["fund_label"] = scatter_df["fund_code"]
+            fig_scatter = px.scatter(
+                scatter_df,
+                x="annualized_vol",
+                y="total_return",
+                hover_name="fund_code",
+                color="sharpe",
+                color_continuous_scale="RdYlGn",
+                size=np.abs(scatter_df["total_return"]).clip(0.001) * 100,
+                labels={
+                    "annualized_vol": "Yıllık Volatilite",
+                    "total_return": "Toplam Getiri",
+                    "sharpe": "Sharpe",
+                },
+                title="Her nokta bir fon — renk: Sharpe, boyut: |getiri|",
+            )
+            fig_scatter.update_layout(
+                margin=dict(l=10, r=10, t=50, b=10),
+                height=450,
+            )
+            st.plotly_chart(fig_scatter, use_container_width=True)
+
+
+# ── TAB 2: FUND COMPARISON ──────────────────────────────────────────────────
+with tab_compare:
+    st.subheader("Fon Karşılaştırma")
+
+    available_funds = sorted(selected_funds)
+    compare_funds = st.multiselect(
+        "Karşılaştırmak istediğiniz fonları seçin (en fazla 10):",
+        options=available_funds,
+        default=available_funds[: min(5, len(available_funds))],
+        max_selections=10,
+    )
+
+    if compare_funds:
+        # Equity curves
+        st.markdown("#### Normalize Edilmiş Fiyat (₺1'den başlayarak)")
+        compare_prices = prices_wide[compare_funds].dropna(how="all")
+        if not compare_prices.empty:
+            normalized = compare_prices / compare_prices.iloc[0]
+            fig_eq = go.Figure()
+            for fund in compare_funds:
+                if fund in normalized.columns:
+                    series = normalized[fund].dropna()
+                    fig_eq.add_trace(
+                        go.Scatter(
+                            x=series.index,
+                            y=series.values,
+                            mode="lines",
+                            name=fund,
+                        )
+                    )
+            fig_eq.update_layout(
+                yaxis_title="Normalize Fiyat",
+                margin=dict(l=10, r=10, t=30, b=10),
+                height=400,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            )
+            st.plotly_chart(fig_eq, use_container_width=True)
+
+        # Return distribution
+        st.markdown("#### Günlük Getiri Dağılımı")
+        compare_rets = returns_long[returns_long["fund_code"].isin(compare_funds)]
+        if not compare_rets.empty:
+            fig_hist = px.histogram(
+                compare_rets,
+                x="ret",
+                color="fund_code",
+                barmode="overlay",
+                nbins=50,
+                opacity=0.6,
+                labels={"ret": "Günlük Getiri", "fund_code": "Fon"},
+            )
+            fig_hist.update_layout(
+                margin=dict(l=10, r=10, t=30, b=10),
+                height=350,
+            )
+            st.plotly_chart(fig_hist, use_container_width=True)
+
+        # Correlation
+        if len(compare_funds) >= 2:
+            st.markdown("#### Korelasyon Matrisi")
+            corr_data = returns_wide[
+                [f for f in compare_funds if f in returns_wide.columns]
+            ].corr()
+            fig_corr = px.imshow(
+                corr_data,
+                text_auto=".2f",
+                aspect="auto",
+                color_continuous_scale="RdBu",
+                zmin=-1,
+                zmax=1,
+            )
+            fig_corr.update_layout(
+                margin=dict(l=10, r=10, t=30, b=10),
+                height=400,
+            )
+            st.plotly_chart(fig_corr, use_container_width=True)
+
+        # Side-by-side KPIs
+        st.markdown("#### KPI Karşılaştırma")
+        if not fund_analytics.empty:
+            kpi_df = fund_analytics[fund_analytics["fund_code"].isin(compare_funds)][
+                [
+                    "fund_code",
+                    "total_return",
+                    "annualized_vol",
+                    "sharpe",
+                    "max_drawdown",
+                    "best_day",
+                    "worst_day",
+                ]
+            ].copy()
+            kpi_df.columns = [
+                "Fon",
+                "Toplam Getiri",
+                "Yıllık Vol",
+                "Sharpe",
+                "MDD",
+                "En İyi Gün",
+                "En Kötü Gün",
+            ]
+            st.dataframe(
+                kpi_df.style.format(
+                    {
+                        "Toplam Getiri": "{:.2%}",
+                        "Yıllık Vol": "{:.2%}",
+                        "Sharpe": "{:.2f}",
+                        "MDD": "{:.2%}",
+                        "En İyi Gün": "{:.2%}",
+                        "En Kötü Gün": "{:.2%}",
+                    }
+                ),
+                use_container_width=True,
+            )
+    else:
+        st.info("Karşılaştırmak için en az 1 fon seçin.")
+
+
+# ── TAB 3: STATISTICAL ANALYSIS ─────────────────────────────────────────────
 with tab_stats:
     st.subheader("Normallik ve Kuyruk Riski Analizi")
-    st.markdown("Getirilerin istatistiksel dağılımı:")
 
     norm_res = check_normality(strategy_returns)
 
     sc1, sc2, sc3, sc4 = st.columns(4)
     sc1.metric(
         "Normal Dağılım mı?",
-        "EVET" if norm_res["is_normal"] else "HAYIR",
-        help="p-value > 0.05 ise Normal kabul edilir.",
+        "EVET ✅" if norm_res["is_normal"] else "HAYIR ❌",
+        help="Shapiro-Wilk: p > 0.05 → Normal kabul edilir.",
     )
     sc2.metric("p-value", f"{norm_res['p_value']:.4f}")
     sc3.metric(
         "Çarpıklık (Skew)",
-        f"{norm_res['skew']:.2f}",
-        help="Negatif skew = Ani çöküş riski (Sol kuyruk).",
+        f"{norm_res['skew']:.3f}",
+        help="< 0: Sol kuyruk riski (ani çöküş). > 0: Sağ kuyruk.",
     )
     sc4.metric(
         "Basıklık (Kurtosis)",
-        f"{norm_res['kurtosis']:.2f}",
-        help="Yüksek değer = 'Fat Tail' (Siyah Kuğu) olasılığı.",
+        f"{norm_res['kurtosis']:.3f}",
+        help="Normal = 0. Yüksek → 'Fat tails' (Siyah Kuğu riski).",
     )
 
     st.plotly_chart(
@@ -406,64 +679,226 @@ with tab_stats:
         use_container_width=True,
     )
 
-# ---- TAB 2: Monte Carlo -------------------------------------------------
+    with st.expander("📖 Nasıl Okunur?"):
+        st.markdown("""
+        **Shapiro-Wilk Testi:** Getiri dağılımının Normal (Gauss) olup olmadığını test eder.
+        Çoğu fon getirisi normal dağılmaz — bu önemlidir çünkü VaR, Sharpe gibi
+        geleneksel metrikler normallik varsayar.
+
+        **Çarpıklık (Skewness):** Negatif çarpıklık, sol kuyruk riskine (ani düşüş)
+        işaret eder. Pozitif çarpıklık, yukarı sürprizlerin daha olası olduğunu gösterir.
+
+        **Basıklık (Kurtosis):** Yüksek basıklık = "fat tails" = uç olaylar normalden
+        daha sık gerçekleşir. Bu, Nassim Taleb'in "Siyah Kuğu" konseptiyle doğrudan ilişkilidir.
+        """)
+
+
+# ── TAB 4: MONTE CARLO ──────────────────────────────────────────────────────
 with tab_monte:
     st.subheader(f"Şans Testi: {actual_k} Fonu Rastgele Seçseydik?")
     st.markdown(
-        "Bu simülasyon, başarınızın 'strateji' mi yoksa "
-        "sadece 'piyasanın yükselmesi' mi olduğunu test eder."
+        "Bu simülasyon, başarınızın gerçek bir 'strateji' mi yoksa "
+        "sadece piyasa rüzgârı mı olduğunu test eder."
     )
 
-    if st.button("Simülasyonu Başlat (1000 Tekrar)"):
+    mc_n_sims = st.slider("Simülasyon sayısı", 100, 10_000, 1_000, step=100)
+
+    if st.button("🚀 Simülasyonu Başlat", type="primary"):
         with st.spinner("Monte Carlo çalışıyor..."):
             mc_result = run_monte_carlo_simulation(
                 prices_wide=prices_wide,
                 actual_k=actual_k,
                 strategy_total_return=total_ret_pct,
-                n_sims=1_000,
+                n_sims=mc_n_sims,
             )
 
             if mc_result.simulated_returns.size == 0:
-                st.warning("Monte Carlo çalıştırılamadı – geçerli fon getirisi yok.")
+                st.warning("Monte Carlo çalıştırılamadı — geçerli fon getirisi yok.")
             else:
                 mc_series = pd.Series(mc_result.simulated_returns)
 
-                fig = px.histogram(
-                    mc_series,
-                    nbins=50,
-                    title="Rastgele Portföylerin Getiri Dağılımı",
-                    labels={"value": "Getiri"},
+                fig = go.Figure()
+                fig.add_trace(
+                    go.Histogram(
+                        x=mc_series,
+                        nbinsx=60,
+                        name="Rastgele Portföyler",
+                        marker_color="rgba(100, 149, 237, 0.6)",
+                    )
                 )
                 fig.add_vline(
                     x=total_ret_pct,
                     line_dash="dash",
                     line_color="red",
-                    annotation_text="Sizin Stratejiniz",
+                    annotation_text=f"Sizin Stratejiniz ({total_ret_pct*100:.1f}%)",
+                    annotation_position="top left",
+                )
+                fig.add_vline(
+                    x=mc_result.median_random,
+                    line_dash="dot",
+                    line_color="gray",
+                    annotation_text=f"Medyan ({mc_result.median_random*100:.1f}%)",
+                    annotation_position="top right",
+                )
+                fig.update_layout(
+                    title=f"{mc_n_sims:,} Rastgele Portföyün Getiri Dağılımı",
+                    xaxis_title="Toplam Getiri",
+                    yaxis_title="Frekans",
+                    margin=dict(l=10, r=10, t=50, b=10),
+                    height=400,
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
-                mc1, mc2, mc3 = st.columns(3)
-                mc1.metric(
-                    "Medyan Rastgele Getiri",
-                    f"%{mc_result.median_random * 100:.2f}",
-                )
-                mc2.metric(
-                    "%5 - %95 Aralığı",
+                mc1, mc2, mc3, mc4 = st.columns(4)
+                mc1.metric("Sizin Getiriniz", f"%{total_ret_pct * 100:.2f}")
+                mc2.metric("Medyan Rastgele", f"%{mc_result.median_random * 100:.2f}")
+                mc3.metric(
+                    "%5 – %95 Aralığı",
                     f"%{mc_result.p5_random * 100:.1f} – "
                     f"%{mc_result.p95_random * 100:.1f}",
                 )
-                mc3.metric(
-                    "Yüzdelik Sıra",
-                    f"%{mc_result.percentile_rank:.1f}",
-                )
+                mc4.metric("Yüzdelik Sıra", f"%{mc_result.percentile_rank:.1f}")
 
-                st.success(
-                    f"Sizin stratejiniz, rastgele oluşturulan portföylerin "
-                    f"**%{mc_result.percentile_rank:.1f}**'inden daha iyi "
-                    f"performans gösterdi."
-                )
+                if mc_result.percentile_rank >= 75:
+                    st.success(
+                        f"🎯 Stratejiniz rastgele portföylerin "
+                        f"**%{mc_result.percentile_rank:.1f}**'inden iyi. "
+                        f"Bu alfa ürettiğinizi gösterir."
+                    )
+                elif mc_result.percentile_rank >= 50:
+                    st.info(
+                        f"📊 Stratejiniz ortalamanın üstünde "
+                        f"(%{mc_result.percentile_rank:.1f}), ama güçlü alfa yok."
+                    )
+                else:
+                    st.warning(
+                        f"⚠️ Stratejiniz rastgele seçimin altında "
+                        f"(%{mc_result.percentile_rank:.1f}). Stratejiyi gözden geçirin."
+                    )
 
-# ---- TAB 3: Detailed Metrics --------------------------------------------
+
+# ── TAB 5: PHYSICS-INSPIRED METRICS ─────────────────────────────────────────
+with tab_physics:
+    st.subheader("⚛️ Fizik-İlhamlı Piyasa Analizi")
+    st.markdown(
+        "İstatistiksel mekanik ve stokastik süreç teorisinden "
+        "ödünç alınan metriklerle piyasa davranışını analiz ediyoruz."
+    )
+
+    # Portfolio-level physics
+    st.markdown("### Portföy Düzeyinde")
+
+    ph1, ph2, ph3, ph4 = st.columns(4)
+
+    # Hurst exponent
+    h_val = hurst_exponent(strategy_equity)
+    ph1.metric(
+        "Hurst Üsteli (H)",
+        f"{h_val:.3f}" if not np.isnan(h_val) else "—",
+        help="H≈0.5: Random walk. H>0.5: Trending. H<0.5: Mean-reverting.",
+    )
+    if not np.isnan(h_val):
+        if h_val > 0.55:
+            ph1.caption("🟢 Süper-difüzyon (trending)")
+        elif h_val < 0.45:
+            ph1.caption("🔵 Alt-difüzyon (mean-reverting)")
+        else:
+            ph1.caption("⚪ Brownian (rastgele yürüyüş)")
+
+    # Shannon entropy
+    ent_val = shannon_entropy(strategy_returns)
+    ph2.metric(
+        "Shannon Entropisi",
+        f"{ent_val:.3f}" if not np.isnan(ent_val) else "—",
+        help="Yüksek → düzensiz/öngörülemez. Düşük → yoğunlaşmış dağılım.",
+    )
+
+    # Mean reversion half-life
+    hl_val = mean_reversion_halflife(strategy_equity)
+    if np.isinf(hl_val):
+        hl_display = "∞ (trending)"
+    elif np.isnan(hl_val):
+        hl_display = "—"
+    else:
+        hl_display = f"{hl_val:.1f} gün"
+    ph3.metric(
+        "Yarı-Ömür (OU)",
+        hl_display,
+        help="Ornstein-Uhlenbeck modeli. Kısa = hızlı ortalamaya dönüş.",
+    )
+
+    # Variance ratio
+    vr_res = variance_ratio_test(strategy_returns, holding_period=5)
+    ph4.metric(
+        "Varyans Oranı (q=5)",
+        (
+            f"{vr_res['variance_ratio']:.3f}"
+            if not np.isnan(vr_res["variance_ratio"])
+            else "—"
+        ),
+        help="VR≈1: Verimli piyasa. VR>1: Momentum. VR<1: Mean reversion.",
+    )
+    ph4.caption(vr_res["regime"])
+
+    with st.expander("📖 Fizik Metrikleri Rehberi"):
+        st.markdown("""
+        #### Hurst Üsteli (Rescaled Range Analysis)
+        Brownian hareketinin genelleştirilmesi olan **Fractional Brownian Motion**'dan
+        gelir. Bir zaman serisinin "hafızasını" ölçer.
+
+        | Değer | Rejim | Fizik Analojisi | Strateji İpucu |
+        |-------|-------|-----------------|----------------|
+        | H < 0.5 | Anti-persistent | Alt-difüzyon | Mean-reversion stratejileri |
+        | H ≈ 0.5 | Random walk | Normal difüzyon | Piyasa verimli, alfa zor |
+        | H > 0.5 | Persistent | Süper-difüzyon | Momentum / trend takibi |
+
+        #### Shannon Entropisi
+        Termodinamiğin 2. yasasından esinlenir. Getiri dağılımının "düzensizliğini" ölçer.
+        Düşük entropi, getirilerin belirli bir bölgede yoğunlaştığını ve potansiyel
+        olarak öngörülebilir olduğunu gösterir.
+
+        #### Ornstein-Uhlenbeck Yarı-Ömrü
+        Fizikteki **sönümlü harmonik osilatör** ile eşdeğer. Fiyatın ortalamadan
+        sapmasının yarıya inmesi için gereken süreyi ölçer. Kısa yarı-ömür,
+        hızlı mean-reversion demektir — pairs trading için idealdir.
+
+        #### Varyans Oranı Testi (Lo-MacKinlay)
+        Difüzyon katsayısının ölçek bağımsız olup olmadığını test eder.
+        Normal Brownian harekette VR = 1 olmalıdır. Sapmalar, piyasanın
+        verimli olmadığına işaret eder.
+        """)
+
+    # Per-fund Hurst values
+    if not fund_analytics.empty and "hurst" in fund_analytics.columns:
+        st.markdown("### Fon Bazında Hurst Üsteli")
+        hurst_df = fund_analytics[["fund_code", "hurst", "total_return"]].dropna(
+            subset=["hurst"]
+        )
+        if not hurst_df.empty:
+            fig_hurst = px.scatter(
+                hurst_df,
+                x="hurst",
+                y="total_return",
+                hover_name="fund_code",
+                color="hurst",
+                color_continuous_scale="RdYlBu_r",
+                labels={"hurst": "Hurst Üsteli", "total_return": "Toplam Getiri"},
+                title="Hurst vs Getiri — Trending mi, Mean-Reverting mi?",
+            )
+            fig_hurst.add_vline(
+                x=0.5,
+                line_dash="dash",
+                line_color="gray",
+                annotation_text="H=0.5 (Random Walk)",
+            )
+            fig_hurst.update_layout(
+                margin=dict(l=10, r=10, t=50, b=10),
+                height=400,
+            )
+            st.plotly_chart(fig_hurst, use_container_width=True)
+
+
+# ── TAB 6: DETAILED METRICS & TABLE ─────────────────────────────────────────
 with tab_metrics:
     st.subheader("Detaylı Metrikler")
 
@@ -559,6 +994,6 @@ with tab_metrics:
                 plot_equity_comparison(comparison_df), use_container_width=True
             )
 
-    # Fund summary table
-    st.subheader("Fon Özeti")
+    # Full fund summary
+    st.subheader("Filtrelenmiş Fon Özeti")
     st.dataframe(filtered_summary, use_container_width=True)
