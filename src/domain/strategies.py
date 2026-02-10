@@ -1,11 +1,35 @@
+# src/domain/strategies.py
 from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 
 from src.types import StrategyParams
 
+logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Monte Carlo result container
+# ---------------------------------------------------------------------------
+@dataclass
+class MonteCarloResult:
+    """Container for Monte Carlo simulation outputs."""
+
+    simulated_returns: np.ndarray  # (n_sims,) array of portfolio total returns
+    strategy_return: float  # the actual strategy return for comparison
+    percentile_rank: float  # % of random portfolios beaten (0-100)
+    median_random: float
+    p5_random: float
+    p95_random: float
+
+
+# ---------------------------------------------------------------------------
+# Universe helpers
+# ---------------------------------------------------------------------------
 def select_universe_k(fund_codes: list[str], k: int, seed: int) -> list[str]:
     rng = np.random.default_rng(seed)
     if k >= len(fund_codes):
@@ -29,6 +53,9 @@ def compute_rebalance_dates(
     raise ValueError(f"Unknown rebalance frequency: {frequency}")
 
 
+# ---------------------------------------------------------------------------
+# Scoring helpers
+# ---------------------------------------------------------------------------
 def _momentum_scores(window: pd.DataFrame) -> pd.Series:
     return (1.0 + window).prod(skipna=True) - 1.0
 
@@ -58,7 +85,11 @@ def _min_variance_weights(window: pd.DataFrame) -> pd.Series:
     cov = window.cov()
     if cov.empty:
         return pd.Series(dtype=float)
-    inv_cov = np.linalg.pinv(cov.values)
+    try:
+        inv_cov = np.linalg.pinv(cov.values)
+    except np.linalg.LinAlgError:
+        logger.warning("Covariance matrix inversion failed, returning empty weights")
+        return pd.Series(dtype=float)
     ones = np.ones(inv_cov.shape[0])
     raw = inv_cov @ ones
     if np.all(np.isnan(raw)):
@@ -79,10 +110,16 @@ def _select_top_k(scores: pd.Series, k: int, low_is_best: bool) -> list[str]:
     return scores.nlargest(k).index.tolist()
 
 
+# ---------------------------------------------------------------------------
+# Weight construction
+# ---------------------------------------------------------------------------
 def build_weights(
     returns_wide: pd.DataFrame,
     params: StrategyParams,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if returns_wide.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
     dates = pd.DatetimeIndex(returns_wide.index)
     rebalance_dates = compute_rebalance_dates(dates, params.rebalance)
     weights_by_date: dict[pd.Timestamp, pd.Series] = {}
@@ -168,6 +205,8 @@ def equal_weight_portfolio(
     returns_long: [date, fund_code, ret]
     Output: portfolio daily return series indexed by date
     """
+    if returns_long.empty:
+        return pd.Series(dtype=float, name="portfolio_ret")
     returns_wide = returns_long.pivot_table(
         index="date", columns="fund_code", values="ret", aggfunc="mean"
     ).sort_index()
@@ -175,86 +214,199 @@ def equal_weight_portfolio(
     return compute_portfolio_returns(returns_wide, weights_daily)
 
 
+# ---------------------------------------------------------------------------
+# Asset-based backtest engine
+# ---------------------------------------------------------------------------
 def backtest_portfolio_assets(
     prices: pd.DataFrame, weights_table: pd.DataFrame, initial_capital: float
 ) -> pd.DataFrame:
     """
-    Gerçekçi Backtest Motoru (Asset/Share Based):
-    - Belirli tarihlerde (rebalance) portföyü hedef ağırlıklara göre yeniden kurar.
-    - Ara günlerde 'shares * price' mantığıyla değer taşır (Weight Drift'e izin verir).
+    Realistic backtest engine (Asset/Share based).
+
+    Between rebalance dates the portfolio value drifts with prices
+    (shares * current_price).  On rebalance dates the portfolio is
+    re-allocated to target weights at zero transaction cost.
 
     Args:
-        prices: [index=date, columns=fund_code] (Wide format fiyatlar)
-        weights_table: [rebalance_date, fund_code, weight]
-        initial_capital: Başlangıç sermayesi (örn: 100.000 TL)
+        prices: Wide-format prices [index=date, columns=fund_code].
+        weights_table: [rebalance_date, fund_code, weight].
+        initial_capital: Starting capital in TL.
 
     Returns:
-        pd.DataFrame: [equity, ret] index=date
+        pd.DataFrame with columns [equity, ret], indexed by date.
+        Returns empty DataFrame on invalid inputs.
     """
     if weights_table.empty or prices.empty:
         return pd.DataFrame()
 
-    # Rebalance tarihlerini sırala
+    if initial_capital <= 0:
+        logger.warning("initial_capital must be > 0, got %s", initial_capital)
+        return pd.DataFrame()
+
+    # Sort rebalance dates
     rebalance_dates = sorted(weights_table["rebalance_date"].unique())
 
-    # Analizi ilk rebalance gününden başlat (Örn: İlk işlem günü)
+    # Start from first rebalance date
     start_date = rebalance_dates[0]
     prices = prices.loc[start_date:].copy()
+    if prices.empty:
+        return pd.DataFrame()
+
     dates = prices.index
 
-    # Hazırlık: Hedef ağırlıkları pivot tabloya çevir
+    # Pivot target weights
     target_weights_df = weights_table.pivot(
         index="rebalance_date", columns="fund_code", values="weight"
     ).fillna(0.0)
 
-    # Simülasyon değişkenleri
+    # Ensure all price columns exist in weights (fill missing with 0)
+    for col in prices.columns:
+        if col not in target_weights_df.columns:
+            target_weights_df[col] = 0.0
+
+    # Simulation state
     current_cash = initial_capital
     current_shares = pd.Series(0.0, index=prices.columns)
-
-    # Günlük portföy değerlerini saklayacak sözlük
     p_values = {}
-
-    # Rebalance günlerini hızlı kontrol için set'e çevir
     reb_set = set(rebalance_dates)
 
     for d in dates:
-        # 1. O günkü fiyatlar
-        # (Fiyatı olmayan fonlar NaN gelebilir, fillna(0) ile değerini 0 sayıyoruz)
         p = prices.loc[d].fillna(0.0)
 
-        # 2. Rebalance Öncesi Portföy Değeri Hesapla
-        # Mevcut hisseler * Bugünkü fiyat + Nakit
+        # Portfolio value BEFORE any rebalance
         val_assets = (current_shares * p).sum()
         total_value = current_cash + val_assets
 
-        # 3. Eğer bugün rebalance günü ise portföyü yeniden dağıt
-        if d in reb_set:
-            # O gün için hedeflenen ağırlıklar
-            w = target_weights_df.loc[d]
+        # Guard against degenerate values
+        if np.isnan(total_value) or total_value < 0:
+            total_value = 0.0
 
-            # Elimizdeki toplam parayı (Hisse + Nakit) ağırlıklara göre bölüştür
-            # (İşlem maliyeti 0 varsayıyoruz)
+        # Rebalance if scheduled
+        if d in reb_set and d in target_weights_df.index:
+            w = target_weights_df.loc[d].reindex(prices.columns, fill_value=0.0)
             target_amounts = total_value * w
 
-            # Yeni hisse adetleri = Hedef Tutar / Fiyat
-            # Fiyatı 0 olan fona bölersek sonsuz çıkar, onu 0 yapalım
-            new_shares = target_amounts / p
+            # shares = amount / price; guard against division by zero
+            with np.errstate(divide="ignore", invalid="ignore"):
+                new_shares = target_amounts / p
             new_shares = new_shares.replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
             current_shares = new_shares
-            current_cash = 0.0  # Full invest varsayımı (küsüratlar ihmal)
+            current_cash = 0.0  # fully invested assumption
 
-            # Rebalance sonrası değeri teyit et (Kontrol amaçlı)
+            # Recalculate after rebalance (sanity)
             val_assets = (current_shares * p).sum()
             total_value = current_cash + val_assets
 
         p_values[d] = total_value
 
-    # Sonuç serisi: Equity Curve (TL cinsinden)
-    result = pd.Series(p_values, name="equity")
+    if not p_values:
+        return pd.DataFrame()
 
-    # Günlük Getiri hesapla (Analizler için gerekli: % değişim)
+    result = pd.Series(p_values, name="equity")
     df_res = pd.DataFrame(result)
     df_res["ret"] = df_res["equity"].pct_change().fillna(0.0)
-
     return df_res
+
+
+# ---------------------------------------------------------------------------
+# Monte Carlo simulation  (NEW)
+# ---------------------------------------------------------------------------
+def run_monte_carlo_simulation(
+    prices_wide: pd.DataFrame,
+    actual_k: int,
+    strategy_total_return: float,
+    n_sims: int = 1_000,
+    seed: int | None = None,
+) -> MonteCarloResult:
+    """
+    Vectorised Monte Carlo: randomly pick *actual_k* funds, compute
+    equal-weight buy-and-hold total return, repeat *n_sims* times.
+
+    Handles NaNs gracefully (funds that start on different dates):
+    - Per-fund total return is computed only over the fund's own valid
+      price range (first non-NaN to last non-NaN).
+    - Funds with < 2 valid price observations are excluded.
+
+    Args:
+        prices_wide: Wide prices [index=date, columns=fund_code].
+        actual_k:    Number of funds to pick per random portfolio.
+        strategy_total_return: The real strategy's total return (for ranking).
+        n_sims:      Number of Monte Carlo iterations.
+        seed:        Optional RNG seed for reproducibility.
+
+    Returns:
+        MonteCarloResult dataclass.
+    """
+    if prices_wide.empty or actual_k < 1:
+        return MonteCarloResult(
+            simulated_returns=np.array([]),
+            strategy_return=strategy_total_return,
+            percentile_rank=np.nan,
+            median_random=np.nan,
+            p5_random=np.nan,
+            p95_random=np.nan,
+        )
+
+    # ------------------------------------------------------------------
+    # 1. Compute per-fund total return (handles NaN start dates)
+    # ------------------------------------------------------------------
+    fund_returns = {}
+    for fund in prices_wide.columns:
+        series = prices_wide[fund].dropna()
+        if len(series) < 2:
+            continue
+        first_price = series.iloc[0]
+        last_price = series.iloc[-1]
+        if first_price == 0 or np.isnan(first_price):
+            continue
+        fund_returns[fund] = (last_price / first_price) - 1.0
+
+    if not fund_returns:
+        return MonteCarloResult(
+            simulated_returns=np.array([]),
+            strategy_return=strategy_total_return,
+            percentile_rank=np.nan,
+            median_random=np.nan,
+            p5_random=np.nan,
+            p95_random=np.nan,
+        )
+
+    valid_returns = np.array(list(fund_returns.values()), dtype=np.float64)
+    n_funds = len(valid_returns)
+    draw_k = min(actual_k, n_funds)
+
+    # ------------------------------------------------------------------
+    # 2. Vectorised random sampling
+    # ------------------------------------------------------------------
+    rng = np.random.default_rng(seed)
+
+    # Build (n_sims, draw_k) index matrix via argsort trick on uniform randoms
+    # This is much faster than a Python loop.
+    rand_matrix = rng.random((n_sims, n_funds))
+    # For each row, the first `draw_k` indices of argsort give a random
+    # sample without replacement.
+    idx_matrix = np.argpartition(rand_matrix, draw_k, axis=1)[:, :draw_k]
+
+    # Gather returns and compute equal-weight portfolio return per sim
+    sampled_returns = valid_returns[idx_matrix]  # (n_sims, draw_k)
+    sim_portfolio_returns = sampled_returns.mean(axis=1)  # (n_sims,)
+
+    # ------------------------------------------------------------------
+    # 3. Statistics
+    # ------------------------------------------------------------------
+    percentile_rank = float(
+        (strategy_total_return > sim_portfolio_returns).mean() * 100
+    )
+    median_random = float(np.median(sim_portfolio_returns))
+    p5_random = float(np.percentile(sim_portfolio_returns, 5))
+    p95_random = float(np.percentile(sim_portfolio_returns, 95))
+
+    return MonteCarloResult(
+        simulated_returns=sim_portfolio_returns,
+        strategy_return=strategy_total_return,
+        percentile_rank=percentile_rank,
+        median_random=median_random,
+        p5_random=p5_random,
+        p95_random=p95_random,
+    )
